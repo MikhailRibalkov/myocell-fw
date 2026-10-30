@@ -10,7 +10,8 @@ use ads1298::{Ads1298, CONFIG2_DEFAULT, Command, Frame, Model, Register};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_bus::spi::{DeviceError, ExclusiveDevice};
 use esp_hal::Async;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
+use esp_hal::gpio::{Input, InputConfig, Io, Level, Output, OutputConfig};
+use esp_hal::interrupt::Priority;
 use esp_hal::pcnt::Pcnt;
 use esp_hal::pcnt::channel::{CtrlMode, EdgeMode};
 use esp_hal::pcnt::unit::Unit;
@@ -142,6 +143,11 @@ impl Frontend {
             .into_async();
         let cs = Output::new(pins.cs, Level::High, OutputConfig::default());
         let spi = ExclusiveDevice::new(bus, cs, Delay).unwrap_or_else(|e| match e {});
+        // The `/DRDY` wake-up goes through the GPIO interrupt, by default at
+        // priority 1 like the Wi-Fi MAC interrupt, and interrupts of equal
+        // priority do not preempt each other. Above everything else, it only
+        // waits for code that masks all interrupts.
+        Io::new(pins.io_mux).set_interrupt_priority(Priority::max());
         let drdy = Input::new(pins.drdy, InputConfig::default());
         let conversions = ConversionCounter::new(pins.pcnt, &drdy);
         let edges = EdgeCapture::new(pins.mcpwm, &drdy);

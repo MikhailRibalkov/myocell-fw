@@ -11,7 +11,7 @@
 
 use esp_hal::peripherals::{
     ADC1, FROM_CPU_INTR0, FROM_CPU_INTR1, GPIO0, GPIO7, GPIO8, GPIO10, GPIO11, GPIO12, GPIO13,
-    GPIO14, GPIO21, GPIO47, GPIO48, MCPWM0, PCNT, PSRAM, Peripherals, SPI2, TIMG0, WIFI,
+    GPIO14, GPIO21, GPIO47, GPIO48, IO_MUX, MCPWM0, PCNT, PSRAM, Peripherals, SPI2, TIMG0, WIFI,
 };
 
 /// Signals between the ESP32-S3 and the ADS1298 analog front-end.
@@ -33,6 +33,12 @@ pub struct AdsPins {
     /// Timestamps `/DRDY` edges in hardware with its capture module, to
     /// measure how late the firmware wakes up.
     pub mcpwm: MCPWM0<'static>,
+    /// Sets the priority of the GPIO interrupt, which serves `/DRDY`.
+    ///
+    /// All GPIO pins share that one interrupt, so any pin interrupt added
+    /// later (e.g. the BOOT button) runs at the same high priority and must
+    /// keep its handling short.
+    pub io_mux: IO_MUX<'static>,
     /// ADS `START`, active high: starts conversions.
     pub start: GPIO21<'static>,
     /// ADS `/RESET`, active low.
@@ -81,6 +87,7 @@ impl Board {
                 drdy: p.GPIO14,
                 pcnt: p.PCNT,
                 mcpwm: p.MCPWM0,
+                io_mux: p.IO_MUX,
                 start: p.GPIO21,
                 reset: p.GPIO48,
                 pwdn: p.GPIO8,
