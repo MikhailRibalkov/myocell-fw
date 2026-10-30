@@ -2,6 +2,7 @@
 //!
 //! Usage: `cargo run --release [-- <bind address>]`, default `0.0.0.0:5005`.
 
+mod spectrum;
 mod tracker;
 
 use std::io::ErrorKind;
@@ -9,54 +10,52 @@ use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 use ads1298::{CHANNELS, Frame, VREF_VOLTS};
-use protocol::setup::CHANNEL_CONFIG;
+use protocol::setup::{CHANNEL_CONFIG, DATA_RATE};
 use tracker::Tracker;
 
 const DEFAULT_ADDR: &str = "0.0.0.0:5005";
 const REPORT_PERIOD: Duration = Duration::from_secs(1);
 
+/// Mains frequency; its harmonics are measured separately.
+const MAINS_HZ: f64 = 50.0;
+const MAINS_HARMONICS: usize = 5;
+/// Peaks are searched up to the Nyquist frequency of 2 kSPS / 2.
+const PEAK_SEARCH_MAX_HZ: u32 = 500;
+
 /// What arrived during one report period. Samples are in microvolts.
 struct Window {
+    packets: u32,
     frames: u32,
     bad_frames: u32,
     bad_packets: u32,
-    sum: [f64; CHANNELS],
-    sum_sq: [f64; CHANNELS],
-    min: [f64; CHANNELS],
-    max: [f64; CHANNELS],
+    /// Lost-frame counter when the window started: a gap inside the window
+    /// breaks its time base, so its spectrum is less reliable.
+    lost_at_start: u64,
+    samples: [Vec<f64>; CHANNELS],
 }
 
 impl Window {
-    fn new() -> Self {
+    fn new(lost_at_start: u64) -> Self {
         Self {
+            packets: 0,
             frames: 0,
             bad_frames: 0,
             bad_packets: 0,
-            sum: [0.0; CHANNELS],
-            sum_sq: [0.0; CHANNELS],
-            min: [f64::INFINITY; CHANNELS],
-            max: [f64::NEG_INFINITY; CHANNELS],
+            lost_at_start,
+            samples: Default::default(),
         }
     }
 
     fn add(&mut self, frame: &Frame) {
         self.frames += 1;
-        for (i, (&raw, config)) in frame.samples.iter().zip(&CHANNEL_CONFIG).enumerate() {
-            let uv = f64::from(config.gain.to_microvolts(raw, VREF_VOLTS));
-            self.sum[i] += uv;
-            self.sum_sq[i] += uv * uv;
-            self.min[i] = self.min[i].min(uv);
-            self.max[i] = self.max[i].max(uv);
+        for ((&raw, config), samples) in frame
+            .samples
+            .iter()
+            .zip(&CHANNEL_CONFIG)
+            .zip(&mut self.samples)
+        {
+            samples.push(f64::from(config.gain.to_microvolts(raw, VREF_VOLTS)));
         }
-    }
-
-    /// Mean and RMS of the AC part (standard deviation) of channel `i`.
-    fn mean_and_rms(&self, i: usize) -> (f64, f64) {
-        let n = f64::from(self.frames);
-        let mean = self.sum[i] / n;
-        // Clamp: rounding can make the variance slightly negative.
-        let variance = (self.sum_sq[i] / n - mean * mean).max(0.0);
-        (mean, variance.sqrt())
     }
 }
 
@@ -71,7 +70,7 @@ fn main() -> std::io::Result<()> {
 
     let mut buf = [0; 2048];
     let mut tracker = Tracker::default();
-    let mut window = Window::new();
+    let mut window = Window::new(0);
     let mut next_report = Instant::now() + REPORT_PERIOD;
 
     loop {
@@ -79,6 +78,7 @@ fn main() -> std::io::Result<()> {
             Ok(len) => match protocol::decode(&buf[..len]) {
                 Ok((header, frames)) => {
                     if tracker.on_packet(&header) {
+                        window.packets += 1;
                         for raw in frames {
                             match Frame::parse(raw) {
                                 Some(frame) => window.add(&frame),
@@ -96,16 +96,22 @@ fn main() -> std::io::Result<()> {
 
         if Instant::now() >= next_report {
             report(&window, &tracker);
-            window = Window::new();
+            window = Window::new(tracker.lost_frames);
             next_report += REPORT_PERIOD;
         }
     }
 }
 
 fn report(window: &Window, tracker: &Tracker) {
+    let gaps = if tracker.lost_frames > window.lost_at_start {
+        " | GAPS IN WINDOW"
+    } else {
+        ""
+    };
     println!(
-        "{} frames/s | lost: {} frames, {} packets | late {} | bad: {} packets, {} frames | restarts {}",
+        "{} frames/s in {} packets | lost: {} frames, {} packets | late {} | bad: {} packets, {} frames | restarts {}{gaps}",
         window.frames,
+        window.packets,
         tracker.lost_frames,
         tracker.lost_packets,
         tracker.late_packets,
@@ -116,18 +122,43 @@ fn report(window: &Window, tracker: &Tracker) {
     if window.frames == 0 {
         return;
     }
+    let sample_rate = f64::from(DATA_RATE.hz());
     let enabled = CHANNEL_CONFIG
         .iter()
         .enumerate()
         .filter(|(_, c)| !c.power_down);
     for (i, _) in enabled {
-        let (mean, rms) = window.mean_and_rms(i);
+        let samples = &window.samples[i];
+        let n = samples.len() as f64;
+        let mean = samples.iter().sum::<f64>() / n;
+        let ac: Vec<f64> = samples.iter().map(|x| x - mean).collect();
+        let variance = ac.iter().map(|x| x * x).sum::<f64>() / n;
+
+        let harmonics: Vec<f64> = (1..=MAINS_HARMONICS)
+            .map(|k| spectrum::tone_rms(&ac, sample_rate, MAINS_HZ * k as f64))
+            .collect();
+        // Powers of orthogonal components add up, so what is left without
+        // the mains harmonics is the rest of the variance.
+        let mains_power: f64 = harmonics.iter().map(|rms| rms * rms).sum();
+        let rest = (variance - mains_power).max(0.0).sqrt();
+
+        let harmonics_text: Vec<String> = harmonics
+            .iter()
+            .enumerate()
+            .map(|(k, rms)| format!("{}:{rms:.1}", (k + 1) * MAINS_HZ as usize))
+            .collect();
+        let peaks_text: Vec<String> = spectrum::peaks(&ac, sample_rate, PEAK_SEARCH_MAX_HZ, 3)
+            .iter()
+            .map(|(f, rms)| format!("{f} Hz {rms:.1}"))
+            .collect();
         println!(
-            "  CH{}: rms {:8.1} uV | mean {:+9.1} uV | p-p {:8.1} uV",
+            "  CH{}: rms {:7.1} | rest {:7.1} | mean {:+8.1} | mains [{}] | peaks [{}]  (uV)",
             i + 1,
-            rms,
+            variance.sqrt(),
+            rest,
             mean,
-            window.max[i] - window.min[i],
+            harmonics_text.join(" "),
+            peaks_text.join(", "),
         );
     }
 }
