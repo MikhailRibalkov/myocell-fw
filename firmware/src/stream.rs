@@ -35,6 +35,9 @@ pub async fn stream_task(stack: Stack<'static>) {
     socket.bind(0).expect("ephemeral port is free");
 
     stack.wait_config_up().await;
+    // The queue overflowed while Wi-Fi was connecting: drop the stale frames
+    // so that the stream starts with fresh, consecutive data.
+    SAMPLES.clear();
     info!("Streaming to {host}");
 
     let mut packet = PacketBuilder::new();
@@ -46,7 +49,7 @@ pub async fn stream_task(stack: Stack<'static>) {
             send(&socket, packet.finish(sequence), host).await;
             sequence = sequence.wrapping_add(1);
         }
-        packet.push(sample.index, &sample.frame.raw);
+        packet.push(sample.index, &sample.raw);
 
         if packet.is_full() {
             send(&socket, packet.finish(sequence), host).await;

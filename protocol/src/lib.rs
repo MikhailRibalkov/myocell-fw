@@ -14,12 +14,14 @@
 
 #![no_std]
 
+pub mod setup;
+
 pub use ads1298::FRAME_LEN;
 
 pub const MAGIC: [u8; 4] = *b"MYO1";
 pub const HEADER_LEN: usize = 14;
-/// 20 ms of data at 1 kSPS; the packet stays well below a 1500-byte MTU.
-pub const FRAMES_PER_PACKET: usize = 20;
+/// 20 ms of data at 2 kSPS; the packet stays below a 1500-byte MTU.
+pub const FRAMES_PER_PACKET: usize = 40;
 pub const MAX_PACKET_LEN: usize = HEADER_LEN + FRAMES_PER_PACKET * FRAME_LEN;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,7 +153,7 @@ mod tests {
 
     #[test]
     fn packet_fits_mtu() {
-        assert_eq!(MAX_PACKET_LEN, 554);
+        assert_eq!(MAX_PACKET_LEN, 1094);
         const { assert!(MAX_PACKET_LEN <= 1472) } // 1500 - IPv4 - UDP headers
     }
 

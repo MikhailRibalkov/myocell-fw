@@ -9,24 +9,27 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use ads1298::Frame;
+use ads1298::FRAME_LEN;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant};
 use log::{error, info};
+use protocol::setup::DATA_RATE;
 
 use crate::board::AdsPins;
-use crate::frontend::{AdsError, DATA_RATE, Frontend};
+use crate::frontend::{AdsError, Frontend};
 
-/// 64 ms of data at 1 kSPS.
-pub const QUEUE_DEPTH: usize = 64;
+/// 1 s of data at 2 kSPS (64 KiB): Wi-Fi occasionally stalls the consumer
+/// for about a second (measured), and the queue has to ride that out.
+pub const QUEUE_DEPTH: usize = 2048;
 
-/// A frame tagged with its conversion index.
+/// A raw frame tagged with its conversion index. Kept compact (32 bytes)
+/// because the queue is deep; the PC parses the samples.
 pub struct Sample {
     /// Counts every conversion since start, read or not: a gap between
     /// consecutive samples is lost data.
     pub index: u32,
-    pub frame: Frame,
+    pub raw: [u8; FRAME_LEN],
 }
 
 pub static SAMPLES: Channel<CriticalSectionRawMutex, Sample, QUEUE_DEPTH> = Channel::new();
@@ -78,7 +81,11 @@ pub async fn acquisition_task(pins: AdsPins) {
 
         match result {
             Ok(frame) => {
-                if SAMPLES.try_send(Sample { index, frame }).is_err() {
+                let sample = Sample {
+                    index,
+                    raw: frame.raw,
+                };
+                if SAMPLES.try_send(sample).is_err() {
                     OVERRUNS.fetch_add(1, Ordering::Relaxed);
                 }
             }

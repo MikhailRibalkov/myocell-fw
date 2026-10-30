@@ -120,12 +120,34 @@ impl Model {
 /// square wave at f_CLK / 2^21 (~1 Hz).
 pub const CONFIG2_TEST_SIGNAL: u8 = 0x10;
 
-/// `CONFIG3`: internal reference buffer on, VREFP = 2.4 V, RLD off.
-/// Bit 6 is reserved and must be written as 1.
-pub const CONFIG3_INTERNAL_REF: u8 = 0xC0;
+/// `CONFIG2`: test signal off (reset value).
+pub const CONFIG2_DEFAULT: u8 = 0x00;
 
-/// Reference voltage selected by [`CONFIG3_INTERNAL_REF`].
+/// Reference voltage with the internal reference buffer, see [`Config3`].
 pub const VREF_VOLTS: f32 = 2.4;
+
+/// Contents of `CONFIG3`. VREFP is fixed at 2.4 V ([`VREF_VOLTS`]);
+/// RLD measurement and lead-off sensing are off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Config3 {
+    /// Internal reference buffer (`PD_REFBUF`).
+    pub internal_reference: bool,
+    /// RLD amplifier powered (`PD_RLD`).
+    pub rld_buffer: bool,
+    /// RLD reference (AVDD + AVSS) / 2 generated internally (`RLDREF_INT`)
+    /// instead of taken from the `RLDREF` pin.
+    pub rld_internal_reference: bool,
+}
+
+impl Config3 {
+    pub const fn to_register(self) -> u8 {
+        const RESERVED: u8 = 1 << 6; // must be written as 1
+        (self.internal_reference as u8) << 7
+            | RESERVED
+            | (self.rld_internal_reference as u8) << 3
+            | (self.rld_buffer as u8) << 2
+    }
+}
 
 /// Output data rate in high-resolution mode (`CONFIG1.DR`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -442,6 +464,28 @@ mod tests {
         assert_eq!(DataRate::Sps1k.hz(), 1000);
         assert_eq!(DataRate::Sps32k.hz(), 32_000);
         assert_eq!(DataRate::Sps500.hz(), 500);
+    }
+
+    #[test]
+    fn config3_bits() {
+        let reference_only = Config3 {
+            internal_reference: true,
+            rld_buffer: false,
+            rld_internal_reference: false,
+        };
+        assert_eq!(reference_only.to_register(), 0xC0);
+
+        let rld_external_ref = Config3 {
+            rld_buffer: true,
+            ..reference_only
+        };
+        assert_eq!(rld_external_ref.to_register(), 0xC4);
+
+        let rld_internal_ref = Config3 {
+            rld_internal_reference: true,
+            ..rld_external_ref
+        };
+        assert_eq!(rld_internal_ref.to_register(), 0xCC);
     }
 
     #[test]

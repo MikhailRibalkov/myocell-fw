@@ -8,22 +8,22 @@ use std::io::ErrorKind;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
-use ads1298::{CHANNELS, Frame, Gain, VREF_VOLTS};
+use ads1298::{CHANNELS, Frame, VREF_VOLTS};
+use protocol::setup::CHANNEL_CONFIG;
 use tracker::Tracker;
 
 const DEFAULT_ADDR: &str = "0.0.0.0:5005";
 const REPORT_PERIOD: Duration = Duration::from_secs(1);
 
-/// Must match `CHANNEL_CONFIG.gain` in the firmware.
-const GAIN: Gain = Gain::X1;
-
-/// What arrived during one report period.
+/// What arrived during one report period. Samples are in microvolts.
 struct Window {
     frames: u32,
     bad_frames: u32,
     bad_packets: u32,
-    min: [i32; CHANNELS],
-    max: [i32; CHANNELS],
+    sum: [f64; CHANNELS],
+    sum_sq: [f64; CHANNELS],
+    min: [f64; CHANNELS],
+    max: [f64; CHANNELS],
 }
 
 impl Window {
@@ -32,17 +32,31 @@ impl Window {
             frames: 0,
             bad_frames: 0,
             bad_packets: 0,
-            min: [i32::MAX; CHANNELS],
-            max: [i32::MIN; CHANNELS],
+            sum: [0.0; CHANNELS],
+            sum_sq: [0.0; CHANNELS],
+            min: [f64::INFINITY; CHANNELS],
+            max: [f64::NEG_INFINITY; CHANNELS],
         }
     }
 
     fn add(&mut self, frame: &Frame) {
         self.frames += 1;
-        for (i, &sample) in frame.samples.iter().enumerate() {
-            self.min[i] = self.min[i].min(sample);
-            self.max[i] = self.max[i].max(sample);
+        for (i, (&raw, config)) in frame.samples.iter().zip(&CHANNEL_CONFIG).enumerate() {
+            let uv = f64::from(config.gain.to_microvolts(raw, VREF_VOLTS));
+            self.sum[i] += uv;
+            self.sum_sq[i] += uv * uv;
+            self.min[i] = self.min[i].min(uv);
+            self.max[i] = self.max[i].max(uv);
         }
+    }
+
+    /// Mean and RMS of the AC part (standard deviation) of channel `i`.
+    fn mean_and_rms(&self, i: usize) -> (f64, f64) {
+        let n = f64::from(self.frames);
+        let mean = self.sum[i] / n;
+        // Clamp: rounding can make the variance slightly negative.
+        let variance = (self.sum_sq[i] / n - mean * mean).max(0.0);
+        (mean, variance.sqrt())
     }
 }
 
@@ -102,8 +116,18 @@ fn report(window: &Window, tracker: &Tracker) {
     if window.frames == 0 {
         return;
     }
-    let uv = |raw| GAIN.to_microvolts(raw, VREF_VOLTS);
-    for (i, (&min, &max)) in window.min.iter().zip(&window.max).enumerate() {
-        println!("  CH{}: {:+9.1} .. {:+9.1} uV", i + 1, uv(min), uv(max));
+    let enabled = CHANNEL_CONFIG
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| !c.power_down);
+    for (i, _) in enabled {
+        let (mean, rms) = window.mean_and_rms(i);
+        println!(
+            "  CH{}: rms {:8.1} uV | mean {:+9.1} uV | p-p {:8.1} uV",
+            i + 1,
+            rms,
+            mean,
+            window.max[i] - window.min[i],
+        );
     }
 }

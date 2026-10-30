@@ -6,10 +6,7 @@
 
 use core::convert::Infallible;
 
-use ads1298::{
-    Ads1298, CONFIG2_TEST_SIGNAL, CONFIG3_INTERNAL_REF, ChannelConfig, ChannelInput, Command,
-    DataRate, Frame, Gain, Model, Register,
-};
+use ads1298::{Ads1298, CONFIG2_DEFAULT, Command, Frame, Model, Register};
 use embassy_time::{Delay, Duration, Timer};
 use embedded_hal_bus::spi::{DeviceError, ExclusiveDevice};
 use esp_hal::Async;
@@ -17,6 +14,7 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
 use esp_hal::spi::Mode;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
+use protocol::setup::{CHANNEL_CONFIG, CONFIG3, DATA_RATE, RLD_SENSE};
 
 use crate::board::AdsPins;
 
@@ -32,16 +30,6 @@ const RESET_DELAY: Duration = Duration::from_micros(10);
 
 /// Settling time of the internal reference buffer after it is enabled.
 const REFERENCE_SETTLE_DELAY: Duration = Duration::from_millis(150);
-
-pub const DATA_RATE: DataRate = DataRate::Sps1k;
-
-/// All channels see the internal 1 mV test square wave: checks the whole
-/// signal chain without electrodes.
-pub const CHANNEL_CONFIG: ChannelConfig = ChannelConfig {
-    power_down: false,
-    gain: Gain::X1,
-    input: ChannelInput::TestSignal,
-};
 
 /// The SPI bus plus software-driven /CS, as seen by the driver.
 pub type AdsSpi = ExclusiveDevice<Spi<'static, Async>, Output<'static>, Delay>;
@@ -104,10 +92,11 @@ impl Frontend {
         Ok(regs)
     }
 
-    /// Writes the configuration. The device must be in SDATAC mode.
+    /// Writes the configuration from [`protocol::setup`]. The device must be
+    /// in SDATAC mode.
     pub async fn configure(&mut self) -> Result<(), AdsError> {
         self.ads
-            .write_register(Register::Config3, CONFIG3_INTERNAL_REF)
+            .write_register(Register::Config3, CONFIG3.to_register())
             .await?;
         Timer::after(REFERENCE_SETTLE_DELAY).await;
 
@@ -115,11 +104,17 @@ impl Frontend {
             .write_register(Register::Config1, DATA_RATE.config1())
             .await?;
         self.ads
-            .write_register(Register::Config2, CONFIG2_TEST_SIGNAL)
+            .write_register(Register::Config2, CONFIG2_DEFAULT)
             .await?;
-        for channel in 1..=8 {
-            self.ads.configure_channel(channel, CHANNEL_CONFIG).await?;
+        for (channel, config) in (1..).zip(CHANNEL_CONFIG) {
+            self.ads.configure_channel(channel, config).await?;
         }
+        self.ads
+            .write_register(Register::RldSensP, RLD_SENSE)
+            .await?;
+        self.ads
+            .write_register(Register::RldSensN, RLD_SENSE)
+            .await?;
         Ok(())
     }
 
