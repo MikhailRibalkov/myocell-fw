@@ -1,6 +1,8 @@
 //! Async driver for the TI ADS1294/6/8(R) analog front-end.
 //!
 //! The driver is generic over [`SpiDevice`], so it knows nothing about the MCU.
+//! The frame read also has a blocking variant for real-time callers, see
+//! [`Ads1298::read_frame_blocking`].
 //! The SPI bus must be configured for mode 1 (CPOL = 0, CPHA = 1), MSB first,
 //! SCLK up to 20 MHz.
 //!
@@ -421,17 +423,38 @@ impl<SPI: SpiDevice> Ads1298<SPI> {
 
     /// Reads one frame in RDATAC mode. Call it after `/DRDY` goes low.
     pub async fn read_frame(&mut self) -> Result<Frame, Error<SPI::Error>> {
-        // Transferring a zeroed buffer guarantees DIN stays low: any other
-        // byte could be decoded as a command.
         let mut raw = [0; FRAME_LEN];
-        self.spi
-            .transaction(&mut [
-                Operation::TransferInPlace(&mut raw),
-                Operation::DelayNs(T_DECODE_NS),
-            ])
-            .await?;
-        Frame::parse(&raw).ok_or(Error::InvalidFrame(raw[0]))
+        self.spi.transaction(&mut frame_read(&mut raw)).await?;
+        parse_frame(&raw)
     }
+}
+
+/// Real-time access: needs an SPI device that also works blocking.
+impl<SPI: embedded_hal::spi::SpiDevice> Ads1298<SPI> {
+    /// Same as [`read_frame`](Self::read_frame), but busy-waits instead of
+    /// awaiting. An await is resumed by an interrupt, which other interrupts
+    /// of the same priority can delay; a frame read must finish before the
+    /// next `/DRDY`, so a caller with a deadline needs this one.
+    pub fn read_frame_blocking(&mut self) -> Result<Frame, Error<SPI::Error>> {
+        let mut raw = [0; FRAME_LEN];
+        self.spi.transaction(&mut frame_read(&mut raw))?;
+        parse_frame(&raw)
+    }
+}
+
+/// The transaction of a frame read, shared by the async and blocking paths.
+fn frame_read(raw: &mut [u8; FRAME_LEN]) -> [Operation<'_, u8>; 2] {
+    // Transferring a zeroed buffer guarantees DIN stays low: any other
+    // byte could be decoded as a command.
+    *raw = [0; FRAME_LEN];
+    [
+        Operation::TransferInPlace(raw),
+        Operation::DelayNs(T_DECODE_NS),
+    ]
+}
+
+fn parse_frame<E>(raw: &[u8; FRAME_LEN]) -> Result<Frame, Error<E>> {
+    Frame::parse(raw).ok_or(Error::InvalidFrame(raw[0]))
 }
 
 #[cfg(test)]
@@ -563,6 +586,39 @@ mod tests {
 
         let frame = block_on(ads.read_frame()).unwrap();
         assert_eq!(frame.samples, [-2; CHANNELS]);
+        spi.done();
+    }
+
+    #[test]
+    fn reads_frame_blocking_like_async() {
+        let raw = raw_frame([0xC0, 0x00, 0x00], [0xFF, 0xFF, 0xFE]);
+        let expectations = [
+            Transaction::transaction_start(),
+            Transaction::transfer_in_place(vec![0; FRAME_LEN], raw.to_vec()),
+            Transaction::delay(T_DECODE_NS),
+            Transaction::transaction_end(),
+        ];
+        let mut spi = Mock::new(&expectations);
+        let mut ads = Ads1298::new(spi.clone());
+
+        let frame = ads.read_frame_blocking().unwrap();
+        assert_eq!(frame.samples, [-2; CHANNELS]);
+        spi.done();
+    }
+
+    #[test]
+    fn blocking_read_rejects_misaligned_frame() {
+        let raw = raw_frame([0x00, 0x00, 0x00], [0, 0, 0]);
+        let expectations = [
+            Transaction::transaction_start(),
+            Transaction::transfer_in_place(vec![0; FRAME_LEN], raw.to_vec()),
+            Transaction::delay(T_DECODE_NS),
+            Transaction::transaction_end(),
+        ];
+        let mut spi = Mock::new(&expectations);
+        let mut ads = Ads1298::new(spi.clone());
+
+        assert_eq!(ads.read_frame_blocking(), Err(Error::InvalidFrame(0x00)));
         spi.done();
     }
 

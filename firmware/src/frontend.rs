@@ -23,7 +23,7 @@ use protocol::setup::{CHANNEL_CONFIG, CONFIG3, DATA_RATE, RLD_SENSE};
 use crate::board::AdsPins;
 use crate::capture::{EdgeCapture, ticks_to_us};
 
-/// A frame takes ~30 us at 8 MHz, well inside the 1 ms sample period.
+/// A frame takes ~30 us at 8 MHz, well inside the 500 us sample period.
 /// The ADS1298 accepts up to 20 MHz.
 const SPI_FREQUENCY: Rate = Rate::from_mhz(8);
 
@@ -232,7 +232,9 @@ impl Frontend {
         // Counted before the read: it names the conversion the output
         // register holds right now.
         let index = self.conversions.read().wrapping_sub(1);
-        let frame = self.ads.read_frame().await;
+        // Blocking: ~35 us of busy-waiting, but an await here would be
+        // resumed by the SPI and timer interrupts, which Wi-Fi delays.
+        let frame = self.ads.read_frame_blocking();
         let done = self.edges.stamp();
 
         Conversion {
