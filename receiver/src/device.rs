@@ -3,6 +3,7 @@
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::broadcast;
@@ -13,6 +14,7 @@ use protocol::setup::{CHANNEL_CONFIG, DATA_RATE};
 
 use crate::live::{Batcher, Update, enabled_channels};
 use crate::parser::StreamParser;
+use crate::recorder::{Command, Recording};
 use crate::spectrum;
 use crate::tracker::Tracker;
 
@@ -84,9 +86,9 @@ impl LiveFeed {
         }
     }
 
-    fn push(&mut self, index: u32, microvolts: &[f32; CHANNELS]) {
-        let samples = enabled_channels().map(|i| microvolts[i]);
-        if let Some(update) = self.batcher.push(index, samples) {
+    /// `samples` are the enabled channels in microvolts.
+    fn push(&mut self, index: u32, samples: &[f32]) {
+        if let Some(update) = self.batcher.push(index, samples.iter().copied()) {
             self.send(update);
         }
     }
@@ -101,6 +103,13 @@ impl LiveFeed {
         // Fails only when no browser is connected: then nobody needs it.
         let _ = self.sender.send(update);
     }
+}
+
+/// Everything a received frame goes to.
+struct Sinks {
+    window: Window,
+    live: LiveFeed,
+    recording: Recording,
 }
 
 /// One TCP connection from the device.
@@ -131,12 +140,7 @@ impl Connection {
 
     /// Reads what has arrived, processes whole packets and acknowledges.
     /// An error ends the connection.
-    fn poll(
-        &mut self,
-        tracker: &mut Tracker,
-        window: &mut Window,
-        live: &mut LiveFeed,
-    ) -> io::Result<()> {
+    fn poll(&mut self, tracker: &mut Tracker, sinks: &mut Sinks) -> io::Result<()> {
         let mut buf = [0; 64 * 1024];
         match self.stream.read(&mut buf) {
             Ok(0) => {
@@ -160,8 +164,13 @@ impl Connection {
         while let Some(packet) = self.parser.next_packet() {
             let packet =
                 packet.map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("{e:?}")))?;
+            let restarts = tracker.restarts;
             let skip = tracker.on_packet(&packet.header);
-            window.packets += 1;
+            if tracker.restarts != restarts {
+                // Before the first frame of the new session is written.
+                sinks.recording.split();
+            }
+            sinks.window.packets += 1;
             // Frames of a packet are consecutive conversions; the index
             // wraps like the device counter (`first..` would panic there).
             let first = packet.header.first_frame.wrapping_add(skip as u32);
@@ -170,10 +179,12 @@ impl Connection {
                 match Frame::parse(raw) {
                     Some(frame) => {
                         let microvolts = microvolts(&frame);
-                        window.add(&microvolts);
-                        live.push(index, &microvolts);
+                        sinks.window.add(&microvolts);
+                        let enabled: Vec<f32> = enabled_channels().map(|i| microvolts[i]).collect();
+                        sinks.live.push(index, &enabled);
+                        sinks.recording.write(index, &enabled);
                     }
-                    None => window.bad_frames += 1,
+                    None => sinks.window.bad_frames += 1,
                 }
             }
         }
@@ -188,9 +199,14 @@ impl Connection {
     }
 }
 
-/// Serves the device: accepts its connections, acknowledges data and
-/// reports statistics. Returns only on a listener error.
-pub fn run(listener: TcpListener, mut live: LiveFeed) -> io::Result<()> {
+/// Serves the device: accepts its connections, acknowledges data, records
+/// on command and reports statistics. Returns only on a listener error.
+pub fn run(
+    listener: TcpListener,
+    live: LiveFeed,
+    commands: Receiver<Command>,
+    recording: Recording,
+) -> io::Result<()> {
     // Polled for new connections between reads: the newest one wins, since
     // a device that reconnects has given up on the old one.
     listener.set_nonblocking(true)?;
@@ -198,10 +214,28 @@ pub fn run(listener: TcpListener, mut live: LiveFeed) -> io::Result<()> {
     let mut connection: Option<Connection> = None;
     let mut connections = 0;
     let mut tracker = Tracker::default();
-    let mut window = Window::new(0);
+    let mut sinks = Sinks {
+        window: Window::new(0),
+        live,
+        recording,
+    };
     let mut next_report = Instant::now() + REPORT_PERIOD;
 
     loop {
+        // Commands are rare and the loop turns at least every 50 ms
+        // (`READ_TIMEOUT`), so polling them here is quick enough.
+        loop {
+            match commands.try_recv() {
+                Ok(command) => {
+                    sinks.recording.handle(command);
+                    sinks.live.send(sinks.recording.status());
+                }
+                Err(TryRecvError::Empty) => break,
+                // The web server is gone; main ends the process.
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
         match listener.accept() {
             Ok((stream, peer)) => {
                 if let Some(old) = &connection {
@@ -218,18 +252,20 @@ pub fn run(listener: TcpListener, mut live: LiveFeed) -> io::Result<()> {
 
         match &mut connection {
             Some(c) => {
-                if let Err(e) = c.poll(&mut tracker, &mut window, &mut live) {
+                if let Err(e) = c.poll(&mut tracker, &mut sinks) {
                     println!("connection from {} lost: {e}", c.peer);
                     connection = None;
                 }
             }
             None => std::thread::sleep(READ_TIMEOUT),
         }
-        live.send_due();
+        sinks.live.send_due();
+        sinks.recording.flush_due();
 
         if Instant::now() >= next_report {
-            report(&window, &tracker, connection.is_some(), connections);
-            window = Window::new(tracker.lost_frames);
+            report(&sinks.window, &tracker, connection.is_some(), connections);
+            sinks.window = Window::new(tracker.lost_frames);
+            sinks.live.send(sinks.recording.status());
             next_report += REPORT_PERIOD;
         }
     }

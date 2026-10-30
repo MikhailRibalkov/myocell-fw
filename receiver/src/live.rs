@@ -33,6 +33,15 @@ pub enum Update {
         first_index: u32,
         channels: Vec<Vec<f32>>,
     },
+    /// Sent on every change and once a second, so a new tab learns it too.
+    Recording {
+        /// The file being written; `None` when not recording.
+        file: Option<String>,
+        /// Recorded signal so far, by the conversion count.
+        seconds: f64,
+        /// Why the last recording ended on its own.
+        error: Option<String>,
+    },
 }
 
 impl Update {

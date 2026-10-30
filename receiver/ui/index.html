@@ -34,6 +34,14 @@
   .channel-head .name { font-weight: 600; }
   .channel-head .info { color: var(--muted); font-variant-numeric: tabular-nums; }
   canvas { display: block; width: 100%; height: 220px; }
+  .record { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-left: auto; }
+  #record-button {
+    font: inherit; font-weight: 600; padding: 6px 14px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--zero); background: var(--panel); color: var(--text);
+  }
+  #record-button:disabled { opacity: 0.5; cursor: default; }
+  #record-button.active { background: var(--bad); border-color: var(--bad); color: var(--panel); }
+  #record-status { color: var(--muted); font-variant-numeric: tabular-nums; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -41,6 +49,10 @@
   <h1>myocell</h1>
   <span class="status">сервер: <b id="ws-status">подключение…</b></span>
   <span class="status">плата: <b id="device-status">—</b></span>
+  <div class="record">
+    <span id="record-status"></span>
+    <button id="record-button" disabled>● Записать</button>
+  </div>
 </header>
 <main id="channels"></main>
 
@@ -60,6 +72,7 @@ let sampleRate = 0;
 let plots = [];
 let expectedIndex = null;
 let lastDataAt = 0;
+let recording = false;
 
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
@@ -157,6 +170,41 @@ function draw(plot) {
     `шкала ±${plot.scale.toFixed(0)} мкВ · среднее (убрано) ${mean.toFixed(0)} мкВ · окно ${WINDOW_S} с`;
 }
 
+// The button shows what the server reports, not what was clicked: another
+// tab or a disk error may change the state too.
+function onRecording(msg) {
+  recording = msg.file !== null;
+  const button = document.getElementById("record-button");
+  const status = document.getElementById("record-status");
+  button.disabled = false;
+  button.textContent = recording ? "■ Остановить" : "● Записать";
+  button.classList.toggle("active", recording);
+  if (recording) {
+    status.textContent = `${msg.file} · ${msg.seconds.toFixed(1)} с`;
+    status.className = "";
+  } else if (msg.error) {
+    status.textContent = `ошибка записи: ${msg.error}`;
+    status.className = "bad";
+  } else {
+    status.textContent = "";
+  }
+}
+
+async function toggleRecording() {
+  const button = document.getElementById("record-button");
+  // Until the server confirms with a `recording` update.
+  button.disabled = true;
+  try {
+    const response = await fetch(`/api/record/${recording ? "stop" : "start"}`, { method: "POST" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  } catch (e) {
+    button.disabled = false;
+    const status = document.getElementById("record-status");
+    status.textContent = `команда не принята: ${e.message}`;
+    status.className = "bad";
+  }
+}
+
 function frame() {
   plots.forEach(draw);
   const status = document.getElementById("device-status");
@@ -174,14 +222,17 @@ function connect() {
     const msg = JSON.parse(event.data);
     if (msg.type === "hello") onHello(msg);
     else if (msg.type === "samples") onSamples(msg);
+    else if (msg.type === "recording") onRecording(msg);
   };
   ws.onclose = () => {
+    document.getElementById("record-button").disabled = true;
     status.textContent = "нет связи, переподключение…";
     status.className = "bad";
     setTimeout(connect, 1000);
   };
 }
 
+document.getElementById("record-button").addEventListener("click", toggleRecording);
 connect();
 requestAnimationFrame(frame);
 </script>

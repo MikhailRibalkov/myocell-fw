@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 ads1298 = { version = "0.1.0", path = "../ads1298" }
 axum = { version = "0.8.9", features = ["ws"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 protocol = { version = "0.1.0", path = "../protocol" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"

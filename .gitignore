@@ -27,3 +27,6 @@ target/
 
 # Wi-Fi credentials and host address, see firmware/.cargo/secrets.toml.example
 firmware/.cargo/secrets.toml
+
+# Signal recordings of the receiver, see receiver/src/recorder.rs
+**/recordings/
