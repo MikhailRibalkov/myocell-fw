@@ -1491,6 +1491,7 @@ dependencies = [
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "esp32s3 0.36.0",
  "log",
  "protocol",
  "static_cell",

@@ -11,7 +11,7 @@
 
 use esp_hal::peripherals::{
     ADC1, FROM_CPU_INTR0, FROM_CPU_INTR1, GPIO0, GPIO7, GPIO8, GPIO10, GPIO11, GPIO12, GPIO13,
-    GPIO14, GPIO21, GPIO47, GPIO48, PSRAM, Peripherals, SPI2, TIMG0, WIFI,
+    GPIO14, GPIO21, GPIO47, GPIO48, MCPWM0, PCNT, PSRAM, Peripherals, SPI2, TIMG0, WIFI,
 };
 
 /// Signals between the ESP32-S3 and the ADS1298 analog front-end.
@@ -27,6 +27,12 @@ pub struct AdsPins {
     pub cs: GPIO10<'static>,
     /// ADS `/DRDY`, active low: a new sample is ready.
     pub drdy: GPIO14<'static>,
+    /// Counts `/DRDY` falling edges in hardware, so every conversion is
+    /// numbered even when the firmware wakes up too late to read it.
+    pub pcnt: PCNT<'static>,
+    /// Timestamps `/DRDY` edges in hardware with its capture module, to
+    /// measure how late the firmware wakes up.
+    pub mcpwm: MCPWM0<'static>,
     /// ADS `START`, active high: starts conversions.
     pub start: GPIO21<'static>,
     /// ADS `/RESET`, active low.
@@ -73,6 +79,8 @@ impl Board {
                 miso: p.GPIO13,
                 cs: p.GPIO10,
                 drdy: p.GPIO14,
+                pcnt: p.PCNT,
+                mcpwm: p.MCPWM0,
                 start: p.GPIO21,
                 reset: p.GPIO48,
                 pwdn: p.GPIO8,
