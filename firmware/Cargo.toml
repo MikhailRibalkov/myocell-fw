@@ -47,6 +47,7 @@ embassy-sync = "0.8.0"
 esp-radio = { version = "1.0.0-beta.1", features = ["esp-alloc", "esp32s3", "log-04", "unstable", "wifi"] }
 embassy-net = { version = "0.9.1", features = ["dhcpv4", "log", "medium-ethernet", "udp"] }
 protocol = { version = "0.1.0", path = "../protocol" }
+embassy-futures = "0.1.2"
 
 
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html

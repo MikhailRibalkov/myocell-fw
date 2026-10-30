@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use embassy_net::Stack;
 use embassy_net::udp::{PacketMetadata, UdpSocket};
+use embassy_time::Instant;
 use log::{error, info};
 use protocol::{MAX_PACKET_LEN, PacketBuilder};
 
@@ -19,6 +20,11 @@ const HOST_ADDR: &str = env!(
 const TX_PACKETS: usize = 4;
 
 pub static PACKETS_SENT: AtomicU32 = AtomicU32::new(0);
+/// Longest `send_to` since the last [`take_peaks`], in microseconds: long
+/// means the socket buffer was full, i.e. Wi-Fi is not keeping up.
+static SEND_TIME_PEAK_US: AtomicU32 = AtomicU32::new(0);
+/// Highest [`SAMPLES`] fill level since the last [`take_peaks`].
+static QUEUE_PEAK: AtomicU32 = AtomicU32::new(0);
 /// Packets not handed to the stack, e.g. no IP address yet.
 pub static SEND_ERRORS: AtomicU32 = AtomicU32::new(0);
 
@@ -44,6 +50,8 @@ pub async fn stream_task(stack: Stack<'static>) {
     let mut sequence: u32 = 0;
     loop {
         let sample = SAMPLES.receive().await;
+        // +1: the sample just taken was in the queue too.
+        QUEUE_PEAK.fetch_max(SAMPLES.len() as u32 + 1, Ordering::Relaxed);
 
         if !packet.accepts(sample.index) {
             send(&socket, packet.finish(sequence), host).await;
@@ -58,8 +66,21 @@ pub async fn stream_task(stack: Stack<'static>) {
     }
 }
 
+/// Returns and resets the peaks: `(longest send in us, queue fill level)`.
+pub fn take_peaks() -> (u32, u32) {
+    (
+        SEND_TIME_PEAK_US.swap(0, Ordering::Relaxed),
+        QUEUE_PEAK.swap(0, Ordering::Relaxed),
+    )
+}
+
 async fn send(socket: &UdpSocket<'_>, bytes: &[u8], host: SocketAddrV4) {
-    match socket.send_to(bytes, host).await {
+    let start = Instant::now();
+    let result = socket.send_to(bytes, host).await;
+    let elapsed = start.elapsed().as_micros().try_into().unwrap_or(u32::MAX);
+    SEND_TIME_PEAK_US.fetch_max(elapsed, Ordering::Relaxed);
+
+    match result {
         Ok(()) => {
             PACKETS_SENT.fetch_add(1, Ordering::Relaxed);
         }

@@ -3,15 +3,20 @@
 //! Credentials come from `.cargo/secrets.toml` (see `secrets.toml.example`)
 //! and are baked in at compile time.
 
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either, select};
 use embassy_net::{Runner, Stack, StackResources};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::peripherals::WIFI;
 use esp_hal::rng::Rng;
 use esp_radio::wifi::sta::StationConfig;
 use esp_radio::wifi::{AuthenticationMethodConfig, Config, Interface, WifiController};
 use log::{info, warn};
 use static_cell::StaticCell;
+
+use crate::acquisition::OVERRUNS;
 
 const SSID: &str = env!(
     "WIFI_SSID",
@@ -23,6 +28,18 @@ const PASSWORD: &str = env!(
 );
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+const MONITOR_PERIOD: Duration = Duration::from_secs(1);
+/// Seconds of continuous queue overruns before forcing a reconnect.
+const STALL_LIMIT: u32 = 5;
+/// Stalls are not counted for this long after the IP comes up.
+const STALL_GRACE: Duration = Duration::from_secs(10);
+
+/// Signal strength of the access point in dBm; 0 while not connected.
+pub static RSSI_DBM: AtomicI32 = AtomicI32::new(0);
+/// Times the link dropped after a successful connection.
+pub static DISCONNECTS: AtomicU32 = AtomicU32::new(0);
+/// Reconnects forced because the link was too slow, see [`monitor_link`].
+pub static STALL_RECONNECTS: AtomicU32 = AtomicU32::new(0);
 
 /// DHCP client, the data UDP socket and one spare.
 const SOCKETS: usize = 3;
@@ -42,7 +59,7 @@ pub fn start(spawner: Spawner, wifi: WIFI<'static>) -> Stack<'static> {
         random_seed(),
     );
 
-    spawner.spawn(connection_task(controller).expect("task pool is free"));
+    spawner.spawn(connection_task(controller, stack).expect("task pool is free"));
     spawner.spawn(net_task(runner).expect("task pool is free"));
     spawner.spawn(link_monitor_task(stack).expect("task pool is free"));
     stack
@@ -57,7 +74,7 @@ fn random_seed() -> u64 {
 
 /// Connects to the access point and reconnects whenever the link drops.
 #[embassy_executor::task]
-async fn connection_task(mut controller: WifiController<'static>) {
+async fn connection_task(mut controller: WifiController<'static>, stack: Stack<'static>) {
     let config = Config::Station(
         StationConfig::default()
             .with_ssid(SSID.try_into().expect("valid SSID"))
@@ -71,12 +88,68 @@ async fn connection_task(mut controller: WifiController<'static>) {
         match controller.connect_async().await {
             Ok(_) => {
                 info!("Wi-Fi connected to {SSID:?}");
-                let reason = controller.wait_for_disconnect_async().await;
-                warn!("Wi-Fi disconnected: {reason:?}");
+                // Both take `&self`, so the link can be monitored while
+                // waiting for the disconnect.
+                let disconnect = controller.wait_for_disconnect_async();
+                let monitor = monitor_link(&controller, stack);
+                match select(disconnect, monitor).await {
+                    Either::First(reason) => {
+                        DISCONNECTS.fetch_add(1, Ordering::Relaxed);
+                        warn!("Wi-Fi disconnected: {reason:?}");
+                    }
+                    Either::Second(()) => {
+                        // The borrows of `select` are over: `&mut` is fine.
+                        STALL_RECONNECTS.fetch_add(1, Ordering::Relaxed);
+                        warn!("Wi-Fi too slow for {STALL_LIMIT} s, reconnecting");
+                        if let Err(e) = controller.disconnect_async().await {
+                            warn!("Wi-Fi disconnect failed: {e:?}");
+                        }
+                    }
+                }
+                RSSI_DBM.store(0, Ordering::Relaxed);
             }
             Err(e) => warn!("Wi-Fi connect failed: {e:?}"),
         }
         Timer::after(RECONNECT_DELAY).await;
+    }
+}
+
+/// Samples the RSSI and returns once the link has been too slow for
+/// [`STALL_LIMIT`] seconds in a row.
+///
+/// After a bad radio spell the station can stay connected at a fraction of
+/// the throughput, with a normal RSSI and no disconnect event (measured);
+/// only a new association brings the speed back.
+async fn monitor_link(controller: &WifiController<'static>, stack: Stack<'static>) {
+    let mut last_overruns = OVERRUNS.load(Ordering::Relaxed);
+    let mut stalled_for = 0;
+    let mut config_up_since: Option<Instant> = None;
+    loop {
+        Timer::after(MONITOR_PERIOD).await;
+        if let Ok(rssi) = controller.rssi() {
+            RSSI_DBM.store(rssi, Ordering::Relaxed);
+        }
+
+        // Overruns are expected while there is no IP yet (nothing drains the
+        // queue) and shortly after: the first send waits for ARP, which once
+        // took 7 s (measured).
+        config_up_since = match (stack.is_config_up(), config_up_since) {
+            (false, _) => None,
+            (true, None) => Some(Instant::now()),
+            (true, since) => since,
+        };
+        let settled = config_up_since.is_some_and(|since| since.elapsed() >= STALL_GRACE);
+
+        let overruns = OVERRUNS.load(Ordering::Relaxed);
+        stalled_for = if overruns != last_overruns && settled {
+            stalled_for + 1
+        } else {
+            0
+        };
+        last_overruns = overruns;
+        if stalled_for >= STALL_LIMIT {
+            return;
+        }
     }
 }
 

@@ -18,10 +18,10 @@ use esp_hal::psram::{Psram, PsramConfig, PsramMode};
 use esp_hal::timer::timg::TimerGroup;
 use esp_rtos::embassy::InterruptExecutor;
 use log::info;
-use myocell_fw::acquisition::{MISSED, OVERRUNS, READ_ERRORS, acquisition_task};
+use myocell_fw::acquisition::{MISSED, OVERRUNS, QUEUE_DEPTH, READ_ERRORS, acquisition_task};
 use myocell_fw::board::Board;
-use myocell_fw::network;
-use myocell_fw::stream::{PACKETS_SENT, SEND_ERRORS, stream_task};
+use myocell_fw::network::{self, DISCONNECTS, RSSI_DBM, STALL_RECONNECTS};
+use myocell_fw::stream::{PACKETS_SENT, SEND_ERRORS, stream_task, take_peaks};
 
 use static_cell::StaticCell;
 
@@ -90,17 +90,29 @@ async fn main(spawner: Spawner) -> ! {
     report_status().await
 }
 
-/// Logs device-side counters once a second; the data itself goes to the PC.
+/// Logs device-side health once a second; the data itself goes to the PC.
 async fn report_status() -> ! {
+    let mut last_packets = 0;
     loop {
         Timer::after(Duration::from_secs(1)).await;
+        let packets = PACKETS_SENT.load(Ordering::Relaxed);
+        let (send_peak_us, queue_peak) = take_peaks();
         info!(
-            "packets sent {}, send errors {}, missed {}, overruns {}, read errors {}",
-            PACKETS_SENT.load(Ordering::Relaxed),
+            "tx {} pkt/s, send max {}.{} ms, queue peak {}/{} | rssi {} dBm, disconnects {}, stall reconnects {} | \
+             send errors {}, missed {}, overruns {}, read errors {}",
+            packets.wrapping_sub(last_packets),
+            send_peak_us / 1000,
+            send_peak_us % 1000 / 100,
+            queue_peak,
+            QUEUE_DEPTH,
+            RSSI_DBM.load(Ordering::Relaxed),
+            DISCONNECTS.load(Ordering::Relaxed),
+            STALL_RECONNECTS.load(Ordering::Relaxed),
             SEND_ERRORS.load(Ordering::Relaxed),
             MISSED.load(Ordering::Relaxed),
             OVERRUNS.load(Ordering::Relaxed),
             READ_ERRORS.load(Ordering::Relaxed),
         );
+        last_packets = packets;
     }
 }

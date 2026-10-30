@@ -72,7 +72,10 @@ pub async fn acquisition_task(pins: AdsPins) {
         let now = Instant::now();
         if let Some(last) = last_frame.replace(now) {
             // Half a period of tolerance for wake-up jitter.
-            let missed = ((now - last) + period / 2).as_ticks() / period.as_ticks() - 1;
+            let periods = ((now - last) + period / 2).as_ticks() / period.as_ticks();
+            // A late wake-up makes the next interval shorter than half a
+            // period: that is 0 periods, and `0 - 1` must not wrap to u64::MAX.
+            let missed = periods.saturating_sub(1);
             if missed > 0 {
                 MISSED.fetch_add(missed as u32, Ordering::Relaxed);
                 index = index.wrapping_add(missed as u32);
