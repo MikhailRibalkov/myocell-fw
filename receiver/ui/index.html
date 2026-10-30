@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>myocell</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #ffffff; --text: #1d2330; --muted: #6b7385;
+    --grid: #e3e6ec; --zero: #c5cad5; --trace: #2563eb; --gap: #f1d9d9;
+    --ok: #15803d; --warn: #b45309; --bad: #b91c1c;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #11141a; --panel: #191d25; --text: #e6e9ef; --muted: #8b93a5;
+      --grid: #262b36; --zero: #3a4150; --trace: #60a5fa; --gap: #3a2226;
+      --ok: #4ade80; --warn: #fbbf24; --bad: #f87171;
+      color-scheme: dark;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; margin-bottom: 12px; }
+  h1 { font-size: 18px; margin: 0; }
+  .status { color: var(--muted); }
+  .status b { font-weight: 600; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .channel { background: var(--panel); border-radius: 8px; padding: 8px 12px 12px; margin-bottom: 12px; }
+  .channel-head { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: baseline; margin-bottom: 4px; }
+  .channel-head .name { font-weight: 600; }
+  .channel-head .info { color: var(--muted); font-variant-numeric: tabular-nums; }
+  canvas { display: block; width: 100%; height: 220px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>myocell</h1>
+  <span class="status">сервер: <b id="ws-status">подключение…</b></span>
+  <span class="status">плата: <b id="device-status">—</b></span>
+</header>
+<main id="channels"></main>
+
+<script>
+"use strict";
+
+// Seconds of signal on screen.
+const WINDOW_S = 5;
+// The vertical scale follows the signal, but shrinks slowly so it does not
+// jump on every quiet moment.
+const SCALE_DECAY = 0.98;
+const MIN_SCALE_UV = 20;
+// No samples for this long: the board is shown as silent.
+const SILENT_MS = 1000;
+
+let sampleRate = 0;
+let plots = [];
+let expectedIndex = null;
+let lastDataAt = 0;
+
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+// One channel: a ring buffer of the last WINDOW_S seconds, NaN marks a gap.
+function createPlot(name) {
+  const box = document.createElement("section");
+  box.className = "channel";
+  box.innerHTML = `<div class="channel-head"><span class="name"></span><span class="info"></span></div><canvas></canvas>`;
+  box.querySelector(".name").textContent = name;
+  document.getElementById("channels").append(box);
+  const buffer = new Float32Array(WINDOW_S * sampleRate).fill(NaN);
+  return { canvas: box.querySelector("canvas"), info: box.querySelector(".info"), buffer, head: 0, scale: MIN_SCALE_UV };
+}
+
+function push(plot, value) {
+  plot.buffer[plot.head] = value;
+  plot.head = (plot.head + 1) % plot.buffer.length;
+}
+
+function onHello(msg) {
+  sampleRate = msg.sample_rate;
+  document.getElementById("channels").replaceChildren();
+  plots = msg.channels.map(createPlot);
+  expectedIndex = null;
+}
+
+function onSamples(msg) {
+  if (expectedIndex !== null && msg.first_index !== expectedIndex) {
+    // Lost frames (or a device restart): mark the gap, at most a screen.
+    const missing = (msg.first_index - expectedIndex) >>> 0;
+    const gap = Math.min(missing, plots[0].buffer.length);
+    for (const plot of plots) for (let i = 0; i < Math.max(gap, 1); i++) push(plot, NaN);
+  }
+  msg.channels.forEach((samples, c) => { for (const v of samples) push(plots[c], v); });
+  expectedIndex = (msg.first_index + msg.channels[0].length) >>> 0;
+  lastDataAt = performance.now();
+}
+
+function draw(plot) {
+  const canvas = plot.canvas;
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.round(canvas.clientWidth * dpr);
+  const height = Math.round(canvas.clientHeight * dpr);
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  const ctx = canvas.getContext("2d");
+  const buf = plot.buffer;
+  const n = buf.length;
+
+  // The ADC sees the electrode DC offset too; it is removed for display
+  // (and shown in the header), so the EMG itself stays visible.
+  let sum = 0, count = 0;
+  for (const v of buf) if (!Number.isNaN(v)) { sum += v; count++; }
+  const mean = count ? sum / count : 0;
+  let peak = 0;
+  for (const v of buf) if (!Number.isNaN(v)) peak = Math.max(peak, Math.abs(v - mean));
+  plot.scale = Math.max(peak * 1.1, plot.scale * SCALE_DECAY, MIN_SCALE_UV);
+
+  ctx.fillStyle = css("--panel");
+  ctx.fillRect(0, 0, width, height);
+
+  // Grid: one line per second, zero and half-scale lines.
+  ctx.fillStyle = css("--grid");
+  for (let s = 1; s < WINDOW_S; s++) ctx.fillRect(Math.round(width * s / WINDOW_S), 0, dpr, height);
+  for (const f of [0.25, 0.75]) ctx.fillRect(0, Math.round(height * f), width, dpr);
+  ctx.fillStyle = css("--zero");
+  ctx.fillRect(0, Math.round(height / 2), width, dpr);
+
+  // One vertical bar per pixel column from the min to the max of its
+  // samples: with several samples per pixel, no spike can fall between
+  // drawn points. The oldest sample is at the left.
+  const y = v => height / 2 - (v - mean) / plot.scale * (height / 2);
+  const gapColor = css("--gap"), traceColor = css("--trace");
+  for (let x = 0; x < width; x++) {
+    const from = Math.floor(x * n / width), to = Math.max(Math.floor((x + 1) * n / width), from + 1);
+    let lo = Infinity, hi = -Infinity, gap = false;
+    for (let i = from; i < to; i++) {
+      const v = buf[(plot.head + i) % n];
+      if (Number.isNaN(v)) { gap = true; continue; }
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    if (hi < lo) {
+      if (gap) { ctx.fillStyle = gapColor; ctx.fillRect(x, 0, 1, height); }
+      continue;
+    }
+    ctx.fillStyle = traceColor;
+    const top = y(hi), bottom = y(lo);
+    ctx.fillRect(x, top, 1, Math.max(bottom - top, dpr));
+  }
+
+  plot.info.textContent =
+    `шкала ±${plot.scale.toFixed(0)} мкВ · среднее (убрано) ${mean.toFixed(0)} мкВ · окно ${WINDOW_S} с`;
+}
+
+function frame() {
+  plots.forEach(draw);
+  const status = document.getElementById("device-status");
+  if (!lastDataAt) { status.textContent = "нет данных"; status.className = "warn"; }
+  else if (performance.now() - lastDataAt > SILENT_MS) { status.textContent = "молчит"; status.className = "bad"; }
+  else { status.textContent = "данные идут"; status.className = "ok"; }
+  requestAnimationFrame(frame);
+}
+
+function connect() {
+  const status = document.getElementById("ws-status");
+  const ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.onopen = () => { status.textContent = "подключён"; status.className = "ok"; };
+  ws.onmessage = event => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === "hello") onHello(msg);
+    else if (msg.type === "samples") onSamples(msg);
+  };
+  ws.onclose = () => {
+    status.textContent = "нет связи, переподключение…";
+    status.className = "bad";
+    setTimeout(connect, 1000);
+  };
+}
+
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

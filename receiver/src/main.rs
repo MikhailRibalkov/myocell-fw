@@ -1,30 +1,54 @@
-//! Receives the myocell TCP stream, acknowledges it and prints statistics
-//! once a second.
+//! Receives the myocell TCP stream, acknowledges it, prints statistics once
+//! a second and shows the signal live in a browser.
 //!
-//! Usage: `cargo run --release [-- <bind address>]`, default `0.0.0.0:5005`.
+//! Usage: `cargo run --release [-- <device bind address>]`, default
+//! `0.0.0.0:5005`; the web UI is at <http://127.0.0.1:8080>.
 
 mod device;
+mod live;
 mod parser;
 mod spectrum;
 mod tracker;
+mod web;
 
 use std::io;
-use std::net::TcpListener;
 use std::thread;
 
-const DEFAULT_ADDR: &str = "0.0.0.0:5005";
+use tokio::sync::broadcast;
 
-fn main() -> io::Result<()> {
-    let addr = std::env::args()
+use crate::device::LiveFeed;
+
+const DEFAULT_DEVICE_ADDR: &str = "0.0.0.0:5005";
+/// Loopback only: the UI is for this computer, not the network.
+const WEB_ADDR: &str = "127.0.0.1:8080";
+/// Batches buffered per browser tab: 64 x 50 ms, about 3 s of signal.
+const LIVE_CAPACITY: usize = 64;
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let device_addr = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| DEFAULT_ADDR.to_owned());
-    let listener = TcpListener::bind(&addr)?;
-    println!("listening on {addr}");
+        .unwrap_or_else(|| DEFAULT_DEVICE_ADDR.to_owned());
+    // Both bound before anything starts, so a busy port fails right here.
+    let device_listener = std::net::TcpListener::bind(&device_addr)?;
+    let web_listener = tokio::net::TcpListener::bind(WEB_ADDR).await?;
+    println!("device: listening on {device_addr}");
+    println!("web UI: http://{WEB_ADDR}");
 
-    // A thread of its own: its blocking reads must not stall the web server
-    // that shares this process.
+    let (updates, _) = broadcast::channel(LIVE_CAPACITY);
+    let live = LiveFeed::new(updates.clone());
+
+    // A thread of its own: its blocking reads must not stall the runtime.
     let device = thread::Builder::new()
         .name("device".into())
-        .spawn(move || device::run(listener))?;
-    device.join().expect("device thread panicked")
+        .spawn(move || device::run(device_listener, live))?;
+    let device = tokio::task::spawn_blocking(move || device.join());
+
+    // Neither side returns unless it fails; the first failure ends both.
+    tokio::select! {
+        result = web::serve(web_listener, updates) => result,
+        joined = device => joined
+            .expect("the join task is never cancelled")
+            .expect("device thread panicked"),
+    }
 }

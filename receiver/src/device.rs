@@ -5,10 +5,13 @@ use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
+use tokio::sync::broadcast;
+
 use ads1298::{CHANNELS, Frame, VREF_VOLTS};
 use protocol::Ack;
 use protocol::setup::{CHANNEL_CONFIG, DATA_RATE};
 
+use crate::live::{Batcher, Update, enabled_channels};
 use crate::parser::StreamParser;
 use crate::spectrum;
 use crate::tracker::Tracker;
@@ -50,16 +53,53 @@ impl Window {
         }
     }
 
-    fn add(&mut self, frame: &Frame) {
+    fn add(&mut self, microvolts: &[f32; CHANNELS]) {
         self.frames += 1;
-        for ((&raw, config), samples) in frame
-            .samples
-            .iter()
-            .zip(&CHANNEL_CONFIG)
-            .zip(&mut self.samples)
-        {
-            samples.push(f64::from(config.gain.to_microvolts(raw, VREF_VOLTS)));
+        for (&uv, samples) in microvolts.iter().zip(&mut self.samples) {
+            samples.push(f64::from(uv));
         }
+    }
+}
+
+/// Converts with the gain each channel was configured with.
+fn microvolts(frame: &Frame) -> [f32; CHANNELS] {
+    let mut out = [0.0; CHANNELS];
+    for ((out, &raw), config) in out.iter_mut().zip(&frame.samples).zip(&CHANNEL_CONFIG) {
+        *out = config.gain.to_microvolts(raw, VREF_VOLTS);
+    }
+    out
+}
+
+/// Forwards the samples of the enabled channels to the web UI.
+pub struct LiveFeed {
+    batcher: Batcher,
+    sender: broadcast::Sender<Update>,
+}
+
+impl LiveFeed {
+    pub fn new(sender: broadcast::Sender<Update>) -> Self {
+        Self {
+            batcher: Batcher::new(enabled_channels().count()),
+            sender,
+        }
+    }
+
+    fn push(&mut self, index: u32, microvolts: &[f32; CHANNELS]) {
+        let samples = enabled_channels().map(|i| microvolts[i]);
+        if let Some(update) = self.batcher.push(index, samples) {
+            self.send(update);
+        }
+    }
+
+    fn send_due(&mut self) {
+        if let Some(update) = self.batcher.take_due() {
+            self.send(update);
+        }
+    }
+
+    fn send(&self, update: Update) {
+        // Fails only when no browser is connected: then nobody needs it.
+        let _ = self.sender.send(update);
     }
 }
 
@@ -91,7 +131,12 @@ impl Connection {
 
     /// Reads what has arrived, processes whole packets and acknowledges.
     /// An error ends the connection.
-    fn poll(&mut self, tracker: &mut Tracker, window: &mut Window) -> io::Result<()> {
+    fn poll(
+        &mut self,
+        tracker: &mut Tracker,
+        window: &mut Window,
+        live: &mut LiveFeed,
+    ) -> io::Result<()> {
         let mut buf = [0; 64 * 1024];
         match self.stream.read(&mut buf) {
             Ok(0) => {
@@ -117,9 +162,17 @@ impl Connection {
                 packet.map_err(|e| io::Error::new(ErrorKind::InvalidData, format!("{e:?}")))?;
             let skip = tracker.on_packet(&packet.header);
             window.packets += 1;
-            for raw in &packet.frames[skip..] {
+            // Frames of a packet are consecutive conversions; the index
+            // wraps like the device counter (`first..` would panic there).
+            let first = packet.header.first_frame.wrapping_add(skip as u32);
+            for (i, raw) in packet.frames[skip..].iter().enumerate() {
+                let index = first.wrapping_add(i as u32);
                 match Frame::parse(raw) {
-                    Some(frame) => window.add(&frame),
+                    Some(frame) => {
+                        let microvolts = microvolts(&frame);
+                        window.add(&microvolts);
+                        live.push(index, &microvolts);
+                    }
                     None => window.bad_frames += 1,
                 }
             }
@@ -137,7 +190,7 @@ impl Connection {
 
 /// Serves the device: accepts its connections, acknowledges data and
 /// reports statistics. Returns only on a listener error.
-pub fn run(listener: TcpListener) -> io::Result<()> {
+pub fn run(listener: TcpListener, mut live: LiveFeed) -> io::Result<()> {
     // Polled for new connections between reads: the newest one wins, since
     // a device that reconnects has given up on the old one.
     listener.set_nonblocking(true)?;
@@ -165,13 +218,14 @@ pub fn run(listener: TcpListener) -> io::Result<()> {
 
         match &mut connection {
             Some(c) => {
-                if let Err(e) = c.poll(&mut tracker, &mut window) {
+                if let Err(e) = c.poll(&mut tracker, &mut window, &mut live) {
                     println!("connection from {} lost: {e}", c.peer);
                     connection = None;
                 }
             }
             None => std::thread::sleep(READ_TIMEOUT),
         }
+        live.send_due();
 
         if Instant::now() >= next_report {
             report(&window, &tracker, connection.is_some(), connections);
