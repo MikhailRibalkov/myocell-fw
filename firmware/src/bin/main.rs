@@ -19,8 +19,8 @@ use esp_hal::timer::timg::TimerGroup;
 use esp_rtos::embassy::InterruptExecutor;
 use log::info;
 use myocell_fw::acquisition::{
-    BACKLOG_CAPACITY, Backlog, MISSED, OVERRUNS, OVERTAKEN, READ_ERRORS, Record, UNACKED,
-    acquisition_task, take_latency_peaks,
+    BACKLOG_CAPACITY, Backlog, LatencyPeaks, MISSED, OVERRUNS, OVERTAKEN, READ_ERRORS, Record,
+    UNACKED, acquisition_task, take_latency_peaks,
 };
 use myocell_fw::board::Board;
 use myocell_fw::network::{self, DISCONNECTS, RSSI_DBM, STALL_RECONNECTS};
@@ -104,16 +104,14 @@ async fn main(spawner: Spawner) -> ! {
 /// Logs device-side health once a second; the data itself goes to the PC.
 async fn report_status() -> ! {
     let mut last_packets = 0;
-    let mut worst_wake_us = 0;
-    let mut worst_read_us = 0;
+    let mut worst = LatencyPeaks::default();
     loop {
         Timer::after(Duration::from_secs(1)).await;
         let packets = PACKETS_SENT.load(Ordering::Relaxed);
         let send_peak_us = take_send_peak();
         let unacked = UNACKED.load(Ordering::Relaxed);
-        let (wake_us, read_us) = take_latency_peaks();
-        worst_wake_us = worst_wake_us.max(wake_us);
-        worst_read_us = worst_read_us.max(read_us);
+        let peaks = take_latency_peaks();
+        worst = worst.max(peaks);
         info!(
             "tx {} pkt/s, send max {}.{} ms, backlog {} ({}.{} s) | tcp {}, losses {} | \
              rssi {} dBm, disconnects {}, stall reconnects {}",
@@ -133,7 +131,7 @@ async fn report_status() -> ! {
             DISCONNECTS.load(Ordering::Relaxed),
             STALL_RECONNECTS.load(Ordering::Relaxed),
         );
-        report_acquisition(wake_us, worst_wake_us, read_us, worst_read_us);
+        report_acquisition(peaks, worst);
         last_packets = packets;
     }
 }
@@ -141,11 +139,16 @@ async fn report_status() -> ! {
 /// A separate frame: formatted next to the network line in the same
 /// function, both argument sets would be on the stack at once.
 #[inline(never)]
-fn report_acquisition(wake_us: u32, worst_wake_us: u32, read_us: u32, worst_read_us: u32) {
+fn report_acquisition(peaks: LatencyPeaks, worst: LatencyPeaks) {
     info!(
-        "ads: wake max {wake_us} us (worst {worst_wake_us}), \
-         read done max {read_us} us (worst {worst_read_us}) | \
+        "ads: max us (worst): edge->isr {} ({}), isr->task {} ({}), edge->read done {} ({}) | \
          missed {}, overtaken {}, overruns {}, read errors {}",
+        peaks.isr_us,
+        worst.isr_us,
+        peaks.task_us,
+        worst.task_us,
+        peaks.read_us,
+        worst.read_us,
         MISSED.load(Ordering::Relaxed),
         OVERTAKEN.load(Ordering::Relaxed),
         OVERRUNS.load(Ordering::Relaxed),

@@ -55,22 +55,40 @@ pub static OVERRUNS: AtomicU32 = AtomicU32::new(0);
 /// Conversions never read: gaps in the hardware conversion count.
 pub static MISSED: AtomicU32 = AtomicU32::new(0);
 
-/// Longest time from `/DRDY` to the wake-up since the last
-/// [`take_latency_peaks`], in microseconds.
-static WAKE_PEAK_US: AtomicU32 = AtomicU32::new(0);
-
-/// Longest time from `/DRDY` to the end of the frame read since the last
-/// [`take_latency_peaks`], in microseconds. This is the one that must stay
-/// below the sample period, so it shows how much margin the task has.
+static ISR_PEAK_US: AtomicU32 = AtomicU32::new(0);
+static TASK_PEAK_US: AtomicU32 = AtomicU32::new(0);
 static READ_PEAK_US: AtomicU32 = AtomicU32::new(0);
 
-/// Returns and resets the longest wake-up and read-done latencies, in
-/// microseconds.
-pub fn take_latency_peaks() -> (u32, u32) {
-    (
-        WAKE_PEAK_US.swap(0, Ordering::Relaxed),
-        READ_PEAK_US.swap(0, Ordering::Relaxed),
-    )
+/// Longest latencies of the frame path, in microseconds, each measured from
+/// the `/DRDY` edge or the previous step.
+#[derive(Clone, Copy, Default)]
+pub struct LatencyPeaks {
+    /// Edge to GPIO interrupt entry: interrupts masked by other code.
+    pub isr_us: u32,
+    /// Interrupt entry to the task: the executor path, run from flash.
+    pub task_us: u32,
+    /// Edge to the end of the frame read. This is the one that must stay
+    /// below the sample period, so it shows how much margin the task has.
+    pub read_us: u32,
+}
+
+impl LatencyPeaks {
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            isr_us: self.isr_us.max(other.isr_us),
+            task_us: self.task_us.max(other.task_us),
+            read_us: self.read_us.max(other.read_us),
+        }
+    }
+}
+
+/// Returns and resets the latency peaks.
+pub fn take_latency_peaks() -> LatencyPeaks {
+    LatencyPeaks {
+        isr_us: ISR_PEAK_US.swap(0, Ordering::Relaxed),
+        task_us: TASK_PEAK_US.swap(0, Ordering::Relaxed),
+        read_us: READ_PEAK_US.swap(0, Ordering::Relaxed),
+    }
 }
 
 /// Frames whose read was still running when the next `/DRDY` came: they may
@@ -111,12 +129,16 @@ pub async fn acquisition_task(pins: AdsPins, mut ring: BacklogProducer) {
     loop {
         let Conversion {
             index,
+            isr_us,
             wake_us,
             read_us,
             overtaken,
             frame: result,
         } = frontend.next_frame().await;
-        WAKE_PEAK_US.fetch_max(wake_us, Ordering::Relaxed);
+        if let Some(isr_us) = isr_us {
+            ISR_PEAK_US.fetch_max(isr_us, Ordering::Relaxed);
+            TASK_PEAK_US.fetch_max(wake_us - isr_us, Ordering::Relaxed);
+        }
         READ_PEAK_US.fetch_max(read_us, Ordering::Relaxed);
         if overtaken {
             OVERTAKEN.fetch_add(1, Ordering::Relaxed);

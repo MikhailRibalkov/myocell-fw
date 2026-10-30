@@ -68,6 +68,9 @@ impl EdgeCapture {
         Self { _mcpwm: mcpwm }
     }
 
+    // The register accessors are inlined, so that a caller placed in RAM
+    // (an interrupt handler) does not call into flash.
+    #[inline(always)]
     fn regs() -> &'static RegisterBlock {
         // SAFETY: `_mcpwm` owns MCPWM0, so nothing else in the firmware uses
         // it, and esp-hal itself never touches the capture registers.
@@ -75,6 +78,7 @@ impl EdgeCapture {
     }
 
     /// The current value of the capture timer.
+    #[inline(always)]
     fn now() -> u32 {
         let regs = Self::regs();
         regs.cap_ch_cfg(NOW_CHANNEL).modify(|_, w| w.sw().set_bit());
@@ -83,6 +87,13 @@ impl EdgeCapture {
 
     /// Takes the time of the last `/DRDY` falling edge and the current time.
     pub fn stamp(&self) -> Stamp {
+        Self::stamp_unowned()
+    }
+
+    /// [`stamp`](Self::stamp) for an interrupt handler, which cannot hold a
+    /// reference to the owner. Valid only once an `EdgeCapture` exists.
+    #[inline(always)]
+    pub fn stamp_unowned() -> Stamp {
         // Edge first: an edge between the two reads then makes the interval
         // longer, never negative.
         let edge = Self::regs().cap_ch(EDGE_CHANNEL).read().value().bits();

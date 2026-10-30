@@ -5,6 +5,7 @@
 //! [`ads1298`] driver and runs the power-up sequence.
 
 use core::convert::Infallible;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use ads1298::{Ads1298, CONFIG2_DEFAULT, Command, Frame, Model, Register};
 use embassy_time::{Delay, Duration, Timer};
@@ -19,6 +20,7 @@ use esp_hal::peripherals::PCNT;
 use esp_hal::spi::Mode;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::time::Rate;
+use esp_hal::{handler, ram};
 use protocol::setup::{CHANNEL_CONFIG, CONFIG3, DATA_RATE, RLD_SENSE};
 
 use crate::board::AdsPins;
@@ -43,6 +45,23 @@ const REFERENCE_SETTLE_DELAY: Duration = Duration::from_millis(150);
 /// also be shorter than the wake-up latency, or the count read right after
 /// the wake-up would not include the edge yet.
 const DRDY_FILTER_CYCLES: u16 = 10;
+
+/// Capture timer value at the entry of the latest GPIO interrupt.
+static ISR_ENTRY: AtomicU32 = AtomicU32::new(0);
+
+/// Runs inside the GPIO interrupt, before esp-hal wakes the waiting task, so
+/// the latency splits into "until the interrupt" and "until the task".
+///
+/// The `/DRDY` wake-up goes through this interrupt, by default at priority 1
+/// like the Wi-Fi MAC interrupt, and interrupts of equal priority do not
+/// preempt each other. Above everything else, it only waits for code that
+/// masks all interrupts.
+// In RAM: from flash, a cache miss would delay the very moment it measures.
+#[ram]
+#[handler(priority = Priority::max())]
+fn drdy_interrupt() {
+    ISR_ENTRY.store(EdgeCapture::stamp_unowned().now, Ordering::Relaxed);
+}
 
 /// The SPI bus plus software-driven /CS, as seen by the driver.
 pub type AdsSpi = ExclusiveDevice<Spi<'static, Async>, Output<'static>, Delay>;
@@ -106,7 +125,12 @@ impl ConversionCounter {
 pub struct Conversion {
     /// Counted in hardware since [`Frontend::start`].
     pub index: u32,
-    /// From the `/DRDY` edge to the wake-up, measured in hardware.
+    /// From the `/DRDY` edge to the entry of the GPIO interrupt: long when
+    /// something keeps all interrupts masked. `None` if the interrupt has
+    /// already run again for a newer edge.
+    pub isr_us: Option<u32>,
+    /// From the `/DRDY` edge to the wake-up, measured in hardware. Minus
+    /// `isr_us`, that is the path through the executor to the task.
     pub wake_us: u32,
     /// From the `/DRDY` edge to the end of the read: must stay below the
     /// sample period, when the ADS overwrites its output register.
@@ -143,14 +167,12 @@ impl Frontend {
             .into_async();
         let cs = Output::new(pins.cs, Level::High, OutputConfig::default());
         let spi = ExclusiveDevice::new(bus, cs, Delay).unwrap_or_else(|e| match e {});
-        // The `/DRDY` wake-up goes through the GPIO interrupt, by default at
-        // priority 1 like the Wi-Fi MAC interrupt, and interrupts of equal
-        // priority do not preempt each other. Above everything else, it only
-        // waits for code that masks all interrupts.
-        Io::new(pins.io_mux).set_interrupt_priority(Priority::max());
         let drdy = Input::new(pins.drdy, InputConfig::default());
         let conversions = ConversionCounter::new(pins.pcnt, &drdy);
         let edges = EdgeCapture::new(pins.mcpwm, &drdy);
+        // After `edges`: the handler reads the capture timer. It also sets
+        // the priority of the GPIO interrupt, see `drdy_interrupt`.
+        Io::new(pins.io_mux).set_interrupt_handler(drdy_interrupt);
 
         Self {
             ads: Ads1298::new(spi),
@@ -235,6 +257,10 @@ impl Frontend {
     pub async fn next_frame(&mut self) -> Conversion {
         self.drdy.wait_for_falling_edge().await;
         let woken = self.edges.stamp();
+        let since_edge = woken.now.wrapping_sub(woken.edge);
+        // Belongs to this edge only if it lies between the edge and now.
+        let isr_ticks = ISR_ENTRY.load(Ordering::Relaxed).wrapping_sub(woken.edge);
+        let isr_us = (isr_ticks <= since_edge).then(|| ticks_to_us(isr_ticks));
         // Counted before the read: it names the conversion the output
         // register holds right now.
         let index = self.conversions.read().wrapping_sub(1);
@@ -245,7 +271,8 @@ impl Frontend {
 
         Conversion {
             index,
-            wake_us: ticks_to_us(woken.now.wrapping_sub(woken.edge)),
+            isr_us,
+            wake_us: ticks_to_us(since_edge),
             // From the edge taken at wake-up: by now a newer edge may have
             // replaced it, and measuring from that one would hide the delay.
             read_us: ticks_to_us(done.now.wrapping_sub(woken.edge)),
