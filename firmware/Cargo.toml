@@ -1,0 +1,62 @@
+[package]
+edition      = "2024"
+name         = "myocell-fw"
+rust-version = "1.95"
+version      = "0.1.0"
+
+[[bin]]
+name = "myocell-fw"
+path = "./src/bin/main.rs"
+
+[dependencies]
+esp-hal = { version = "~1.2.2", features = ["esp32s3", "log-04", "unstable"] }
+
+esp-rtos = { version = "0.4.0", features = [
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32s3",
+  "log-04",
+] }
+
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32s3", "log-04"] }
+log                    = "0.4.27"
+
+embassy-executor = { version = "0.10.0", features = ["log"] }
+embassy-time = { version = "0.5.0", features = ["log"] }
+esp-alloc = { version = "0.11.0", features = ["esp32s3"] }
+esp-backtrace = { version = "0.20.0", features = [
+  "esp32s3",
+  "panic-handler",
+  "println",
+] }
+# No `critical-section`: it keeps interrupts disabled while a whole line is
+# formatted and sent, which makes the ADS acquisition miss /DRDY edges.
+esp-println = { version = "0.18.0", default-features = false, features = [
+  "colors",
+  "esp32s3",
+  "jtag-serial",
+  "log-04",
+] }
+
+critical-section = "1.2.0"
+static_cell      = "2.1.1"
+ads1298 = { version = "0.1.0", path = "../ads1298" }
+embedded-hal-bus = { version = "0.3.0", default-features = false, features = ["async"] }
+embassy-sync = "0.8.0"
+esp-radio = { version = "1.0.0-beta.1", features = ["esp-alloc", "esp32s3", "log-04", "unstable", "wifi"] }
+embassy-net = { version = "0.9.1", features = ["dhcpv4", "log", "medium-ethernet", "udp"] }
+protocol = { version = "0.1.0", path = "../protocol" }
+
+
+# For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+[profile.dev]
+# The default debug profile is too slow and too big for resource-constrained devices.
+# Always build with some optimizations enabled.
+opt-level = "s"
+
+[profile.release]
+codegen-units = 1     # LLVM can perform better optimizations using a single thread
+debug         = 2     # prefer slower builds but better debugging experience
+lto           = 'fat'
+opt-level     = 's'

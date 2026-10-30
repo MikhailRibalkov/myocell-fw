@@ -1,0 +1,8 @@
+[package]
+name = "receiver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ads1298 = { version = "0.1.0", path = "../ads1298" }
+protocol = { version = "0.1.0", path = "../protocol" }
