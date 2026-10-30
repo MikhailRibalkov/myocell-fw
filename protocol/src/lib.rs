@@ -1,13 +1,20 @@
-//! UDP stream format between the myocell firmware and the PC receiver.
+//! TCP stream format between the myocell firmware and the PC receiver.
+//!
+//! Device to PC, a sequence of packets:
 //!
 //! ```text
 //! offset size
-//! 0      4    magic "MYO1"
-//! 4      4    sequence     u32 LE, packet counter: gaps = network loss
+//! 0      4    magic "MYO2"
+//! 4      4    sequence     u32 LE, packet counter
 //! 8      4    first_frame  u32 LE, conversion index of the first frame
 //! 12     2    frame_count  u16 LE, 1..=FRAMES_PER_PACKET
 //! 14     27*N raw ADS1298 frames, consecutive conversions
 //! ```
+//!
+//! PC to device, [`Ack`] messages: "every frame before `next_frame` has
+//! arrived". The device keeps frames until they are acknowledged and sends
+//! the unacknowledged ones again after a reconnect, so the PC may see a
+//! frame twice and drops repeats by conversion index.
 //!
 //! Conversion indices count every conversion of the ADC, including the ones
 //! the device failed to read, so any gap in `first_frame` is lost data.
@@ -18,7 +25,9 @@ pub mod setup;
 
 pub use ads1298::FRAME_LEN;
 
-pub const MAGIC: [u8; 4] = *b"MYO1";
+pub const MAGIC: [u8; 4] = *b"MYO2";
+pub const ACK_MAGIC: [u8; 4] = *b"MYOA";
+pub const ACK_LEN: usize = 8;
 pub const HEADER_LEN: usize = 14;
 /// 20 ms of data at 2 kSPS; the packet stays below a 1500-byte MTU.
 pub const FRAMES_PER_PACKET: usize = 40;
@@ -37,6 +46,9 @@ pub enum DecodeError {
     BadMagic,
     /// The payload length does not match `frame_count`.
     LengthMismatch,
+    /// `frame_count` is 0 or above [`FRAMES_PER_PACKET`]: on a byte stream
+    /// this means the reader lost the packet boundaries.
+    BadFrameCount,
 }
 
 impl Header {
@@ -48,29 +60,66 @@ impl Header {
         out[12..14].copy_from_slice(&self.frame_count.to_le_bytes());
         out
     }
+
+    pub fn payload_len(&self) -> usize {
+        usize::from(self.frame_count) * FRAME_LEN
+    }
 }
 
-/// Splits a packet into its header and raw frames.
+/// Parses a packet header. On a byte stream, read [`HEADER_LEN`] bytes,
+/// decode them, then read [`Header::payload_len`] more.
+pub fn decode_header(bytes: &[u8; HEADER_LEN]) -> Result<Header, DecodeError> {
+    if bytes[0..4] != MAGIC {
+        return Err(DecodeError::BadMagic);
+    }
+    // The ranges have fixed lengths, so the conversions to arrays cannot fail.
+    let header = Header {
+        sequence: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        first_frame: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        frame_count: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
+    };
+    if !(1..=FRAMES_PER_PACKET).contains(&usize::from(header.frame_count)) {
+        return Err(DecodeError::BadFrameCount);
+    }
+    Ok(header)
+}
+
+/// Splits a whole packet into its header and raw frames.
 pub fn decode(packet: &[u8]) -> Result<(Header, &[[u8; FRAME_LEN]]), DecodeError> {
     let (header, payload) = packet
         .split_first_chunk::<HEADER_LEN>()
         .ok_or(DecodeError::TooShort)?;
-    if header[0..4] != MAGIC {
-        return Err(DecodeError::BadMagic);
-    }
-
-    // The ranges have fixed lengths, so the conversions to arrays cannot fail.
-    let header = Header {
-        sequence: u32::from_le_bytes(header[4..8].try_into().unwrap()),
-        first_frame: u32::from_le_bytes(header[8..12].try_into().unwrap()),
-        frame_count: u16::from_le_bytes(header[12..14].try_into().unwrap()),
-    };
+    let header = decode_header(header)?;
 
     let (frames, rest) = payload.as_chunks::<FRAME_LEN>();
     if !rest.is_empty() || frames.len() != usize::from(header.frame_count) {
         return Err(DecodeError::LengthMismatch);
     }
     Ok((header, frames))
+}
+
+/// Acknowledgement from the PC: every frame before `next_frame` arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ack {
+    pub next_frame: u32,
+}
+
+impl Ack {
+    pub fn encode(&self) -> [u8; ACK_LEN] {
+        let mut out = [0; ACK_LEN];
+        out[0..4].copy_from_slice(&ACK_MAGIC);
+        out[4..8].copy_from_slice(&self.next_frame.to_le_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8; ACK_LEN]) -> Result<Self, DecodeError> {
+        if bytes[0..4] != ACK_MAGIC {
+            return Err(DecodeError::BadMagic);
+        }
+        Ok(Self {
+            next_frame: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        })
+    }
 }
 
 /// Accumulates consecutive frames into one packet, without allocation.
@@ -194,6 +243,28 @@ mod tests {
     }
 
     #[test]
+    fn ack_round_trip() {
+        let ack = Ack {
+            next_frame: 123_456,
+        };
+        assert_eq!(Ack::decode(&ack.encode()), Ok(ack));
+        let mut bad = ack.encode();
+        bad[0] = b'X';
+        assert_eq!(Ack::decode(&bad), Err(DecodeError::BadMagic));
+    }
+
+    #[test]
+    fn stream_reading_by_header() {
+        let mut builder = PacketBuilder::new();
+        builder.push(7, &frame(1));
+        builder.push(8, &frame(2));
+        let packet = builder.finish(3).to_vec();
+
+        let header = decode_header(packet[..HEADER_LEN].try_into().unwrap()).unwrap();
+        assert_eq!(HEADER_LEN + header.payload_len(), packet.len());
+    }
+
+    #[test]
     fn index_wraps_around() {
         let mut builder = PacketBuilder::new();
         builder.push(u32::MAX, &frame(0));
@@ -207,6 +278,12 @@ mod tests {
         let packet = builder.finish(0).to_vec();
 
         assert_eq!(decode(&packet[..10]), Err(DecodeError::TooShort));
+        let mut zero_frames = packet.clone();
+        zero_frames[12..14].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(decode(&zero_frames), Err(DecodeError::BadFrameCount));
+        let mut too_many = packet.clone();
+        too_many[12..14].copy_from_slice(&1000u16.to_le_bytes());
+        assert_eq!(decode(&too_many), Err(DecodeError::BadFrameCount));
         let mut bad_magic = packet.clone();
         bad_magic[0] = b'X';
         assert_eq!(decode(&bad_magic), Err(DecodeError::BadMagic));

@@ -18,10 +18,12 @@ use esp_hal::psram::{Psram, PsramConfig, PsramMode};
 use esp_hal::timer::timg::TimerGroup;
 use esp_rtos::embassy::InterruptExecutor;
 use log::info;
-use myocell_fw::acquisition::{MISSED, OVERRUNS, QUEUE_DEPTH, READ_ERRORS, acquisition_task};
+use myocell_fw::acquisition::{
+    BACKLOG_CAPACITY, Backlog, MISSED, OVERRUNS, READ_ERRORS, Record, UNACKED, acquisition_task,
+};
 use myocell_fw::board::Board;
 use myocell_fw::network::{self, DISCONNECTS, RSSI_DBM, STALL_RECONNECTS};
-use myocell_fw::stream::{PACKETS_SENT, SEND_ERRORS, stream_task, take_peaks};
+use myocell_fw::stream::{CONNECTED, CONNECTION_LOSSES, PACKETS_SENT, stream_task, take_send_peak};
 
 use static_cell::StaticCell;
 
@@ -29,6 +31,8 @@ extern crate alloc;
 
 /// Runs real-time tasks: preempts everything in thread mode.
 static REALTIME_EXECUTOR: StaticCell<InterruptExecutor<1>> = StaticCell::new();
+
+static BACKLOG: StaticCell<Backlog> = StaticCell::new();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -69,10 +73,16 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::psram_allocator!(&psram);
     info!("{}", esp_alloc::HEAP.stats());
 
-    // Too large for the internal heap, so it must land in PSRAM.
-    let big = alloc::vec![0u8; 1024 * 1024];
-    info!("1 MiB test buffer at {:p}", big.as_ptr());
-    drop(big);
+    // 12 MiB is far too large for the internal heap, so it lands in PSRAM.
+    // The ring's positions, atomics, stay in internal RAM (`BACKLOG`).
+    let storage = alloc::vec![Record::EMPTY; BACKLOG_CAPACITY].leak();
+    info!(
+        "Backlog: {} records, {} KiB at {:p}",
+        storage.len(),
+        size_of_val(storage) / 1024,
+        storage.as_ptr()
+    );
+    let (producer, consumer) = BACKLOG.init(Backlog::new(storage)).split();
 
     let timg0 = TimerGroup::new(board.timg0);
     esp_rtos::start(timg0.timer0, board.sw_int);
@@ -82,10 +92,10 @@ async fn main(spawner: Spawner) -> ! {
     let realtime = REALTIME_EXECUTOR
         .init(InterruptExecutor::new(board.realtime_int))
         .start(Priority::Priority2);
-    realtime.spawn(acquisition_task(board.ads).expect("task pool is free"));
+    realtime.spawn(acquisition_task(board.ads, producer).expect("task pool is free"));
 
     let stack = network::start(spawner, board.wifi);
-    spawner.spawn(stream_task(stack).expect("task pool is free"));
+    spawner.spawn(stream_task(stack, consumer).expect("task pool is free"));
 
     report_status().await
 }
@@ -96,19 +106,26 @@ async fn report_status() -> ! {
     loop {
         Timer::after(Duration::from_secs(1)).await;
         let packets = PACKETS_SENT.load(Ordering::Relaxed);
-        let (send_peak_us, queue_peak) = take_peaks();
+        let send_peak_us = take_send_peak();
+        let unacked = UNACKED.load(Ordering::Relaxed);
         info!(
-            "tx {} pkt/s, send max {}.{} ms, queue peak {}/{} | rssi {} dBm, disconnects {}, stall reconnects {} | \
-             send errors {}, missed {}, overruns {}, read errors {}",
+            "tx {} pkt/s, send max {}.{} ms, backlog {} ({}.{} s) | tcp {}, losses {} | \
+             rssi {} dBm, disconnects {}, stall reconnects {} | missed {}, overruns {}, read errors {}",
             packets.wrapping_sub(last_packets),
             send_peak_us / 1000,
             send_peak_us % 1000 / 100,
-            queue_peak,
-            QUEUE_DEPTH,
+            unacked,
+            unacked / 2000,
+            unacked % 2000 / 200,
+            if CONNECTED.load(Ordering::Relaxed) {
+                "up"
+            } else {
+                "down"
+            },
+            CONNECTION_LOSSES.load(Ordering::Relaxed),
             RSSI_DBM.load(Ordering::Relaxed),
             DISCONNECTS.load(Ordering::Relaxed),
             STALL_RECONNECTS.load(Ordering::Relaxed),
-            SEND_ERRORS.load(Ordering::Relaxed),
             MISSED.load(Ordering::Relaxed),
             OVERRUNS.load(Ordering::Relaxed),
             READ_ERRORS.load(Ordering::Relaxed),

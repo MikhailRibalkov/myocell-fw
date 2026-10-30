@@ -1,8 +1,9 @@
 //! Real-time sample acquisition from the ADS1298.
 //!
-//! [`acquisition_task`] owns the [`Frontend`] and pushes every frame into
-//! [`SAMPLES`]. It never waits for the consumer: a full queue drops the frame
-//! and bumps [`OVERRUNS`], so data loss is counted instead of hidden.
+//! [`acquisition_task`] owns the [`Frontend`] and appends every frame to the
+//! store-and-forward ring in PSRAM ([`Backlog`]). It never waits for the
+//! consumer: a full ring drops the frame and bumps [`OVERRUNS`], so data loss
+//! is counted instead of hidden.
 //!
 //! The task must run on a high-priority interrupt executor: every frame has
 //! to be read before the next `/DRDY`, whatever the thread mode is doing.
@@ -11,7 +12,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 
 use ads1298::FRAME_LEN;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant};
 use log::{error, info};
 use protocol::setup::DATA_RATE;
@@ -19,22 +20,37 @@ use protocol::setup::DATA_RATE;
 use crate::board::AdsPins;
 use crate::frontend::{AdsError, Frontend};
 
-/// 1 s of data at 2 kSPS (64 KiB): Wi-Fi occasionally stalls the consumer
-/// for about a second (measured), and the queue has to ride that out.
-pub const QUEUE_DEPTH: usize = 2048;
+/// Records in the ring: 12 MiB, about 3 minutes at 2 kSPS.
+pub const BACKLOG_CAPACITY: usize = 12 * 1024 * 1024 / size_of::<Record>();
 
-/// A raw frame tagged with its conversion index. Kept compact (32 bytes)
-/// because the queue is deep; the PC parses the samples.
-pub struct Sample {
+/// A raw frame tagged with its conversion index: 32 bytes with padding.
+#[derive(Clone, Copy)]
+pub struct Record {
     /// Counts every conversion since start, read or not: a gap between
-    /// consecutive samples is lost data.
+    /// consecutive records is lost data.
     pub index: u32,
     pub raw: [u8; FRAME_LEN],
 }
 
-pub static SAMPLES: Channel<CriticalSectionRawMutex, Sample, QUEUE_DEPTH> = Channel::new();
+impl Record {
+    pub const EMPTY: Self = Self {
+        index: 0,
+        raw: [0; FRAME_LEN],
+    };
+}
 
-/// Frames dropped because [`SAMPLES`] was full.
+pub type Backlog = backlog::Backlog<'static, Record>;
+pub type BacklogProducer = backlog::Producer<'static, 'static, Record>;
+pub type BacklogConsumer = backlog::Consumer<'static, 'static, Record>;
+
+/// Raised after every new record, so the sender need not poll the ring.
+pub static NEW_DATA: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Records not acknowledged by the PC yet, published by the producer, which
+/// keeps running even when the sender is blocked.
+pub static UNACKED: AtomicU32 = AtomicU32::new(0);
+
+/// Frames dropped because the ring was full of unacknowledged data.
 pub static OVERRUNS: AtomicU32 = AtomicU32::new(0);
 
 /// Conversions never read: detected as gaps between consecutive frames.
@@ -55,7 +71,7 @@ async fn bring_up(frontend: &mut Frontend) -> Result<(), AdsError> {
 /// Takes raw pins rather than a ready [`Frontend`]: async esp-hal drivers are
 /// `!Send`, so they are created on the executor that polls them.
 #[embassy_executor::task]
-pub async fn acquisition_task(pins: AdsPins) {
+pub async fn acquisition_task(pins: AdsPins, mut ring: BacklogProducer) {
     let mut frontend = Frontend::new(pins);
     if let Err(e) = bring_up(&mut frontend).await {
         error!("ADS bring-up failed: {e:?}");
@@ -84,13 +100,15 @@ pub async fn acquisition_task(pins: AdsPins) {
 
         match result {
             Ok(frame) => {
-                let sample = Sample {
+                let record = Record {
                     index,
                     raw: frame.raw,
                 };
-                if SAMPLES.try_send(sample).is_err() {
+                if ring.push(record).is_err() {
                     OVERRUNS.fetch_add(1, Ordering::Relaxed);
                 }
+                NEW_DATA.signal(());
+                UNACKED.store(ring.unacked(), Ordering::Relaxed);
             }
             Err(e) => {
                 // Log only the first one: at 1 kSPS a persistent fault would

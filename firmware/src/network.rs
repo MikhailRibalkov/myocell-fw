@@ -16,7 +16,8 @@ use esp_radio::wifi::{AuthenticationMethodConfig, Config, Interface, WifiControl
 use log::{info, warn};
 use static_cell::StaticCell;
 
-use crate::acquisition::OVERRUNS;
+use crate::acquisition::UNACKED;
+use crate::stream::CONNECTED;
 
 const SSID: &str = env!(
     "WIFI_SSID",
@@ -29,8 +30,10 @@ const PASSWORD: &str = env!(
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const MONITOR_PERIOD: Duration = Duration::from_secs(1);
-/// Seconds of continuous queue overruns before forcing a reconnect.
+/// Seconds of a growing backlog before forcing a reconnect.
 const STALL_LIMIT: u32 = 5;
+/// Unacknowledged records that count as falling behind: 1 s at 2 kSPS.
+const STALL_BACKLOG: u32 = 2000;
 /// Stalls are not counted for this long after the IP comes up.
 const STALL_GRACE: Duration = Duration::from_secs(10);
 
@@ -115,13 +118,15 @@ async fn connection_task(mut controller: WifiController<'static>, stack: Stack<'
 }
 
 /// Samples the RSSI and returns once the link has been too slow for
-/// [`STALL_LIMIT`] seconds in a row.
+/// [`STALL_LIMIT`] seconds in a row: the PC is connected, yet the
+/// unacknowledged backlog is above [`STALL_BACKLOG`] and not shrinking.
 ///
 /// After a bad radio spell the station can stay connected at a fraction of
 /// the throughput, with a normal RSSI and no disconnect event (measured);
-/// only a new association brings the speed back.
+/// only a new association brings the speed back. Without a receiver there
+/// is nobody to send to, and reconnecting Wi-Fi would not help.
 async fn monitor_link(controller: &WifiController<'static>, stack: Stack<'static>) {
-    let mut last_overruns = OVERRUNS.load(Ordering::Relaxed);
+    let mut last_unacked = UNACKED.load(Ordering::Relaxed);
     let mut stalled_for = 0;
     let mut config_up_since: Option<Instant> = None;
     loop {
@@ -130,9 +135,8 @@ async fn monitor_link(controller: &WifiController<'static>, stack: Stack<'static
             RSSI_DBM.store(rssi, Ordering::Relaxed);
         }
 
-        // Overruns are expected while there is no IP yet (nothing drains the
-        // queue) and shortly after: the first send waits for ARP, which once
-        // took 7 s (measured).
+        // A backlog is expected while there is no IP yet and shortly after:
+        // the first send waits for ARP, which once took 7 s (measured).
         config_up_since = match (stack.is_config_up(), config_up_since) {
             (false, _) => None,
             (true, None) => Some(Instant::now()),
@@ -140,13 +144,14 @@ async fn monitor_link(controller: &WifiController<'static>, stack: Stack<'static
         };
         let settled = config_up_since.is_some_and(|since| since.elapsed() >= STALL_GRACE);
 
-        let overruns = OVERRUNS.load(Ordering::Relaxed);
-        stalled_for = if overruns != last_overruns && settled {
+        let unacked = UNACKED.load(Ordering::Relaxed);
+        let falling_behind = unacked > STALL_BACKLOG && unacked >= last_unacked;
+        stalled_for = if falling_behind && settled && CONNECTED.load(Ordering::Relaxed) {
             stalled_for + 1
         } else {
             0
         };
-        last_overruns = overruns;
+        last_unacked = unacked;
         if stalled_for >= STALL_LIMIT {
             return;
         }

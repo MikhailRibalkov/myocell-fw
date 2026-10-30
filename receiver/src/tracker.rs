@@ -1,55 +1,60 @@
-//! Loss accounting from packet headers.
+//! Loss and duplicate accounting from packet headers.
 
 use protocol::Header;
-
-/// A packet this far behind is a device restart rather than a late packet.
-const RESTART_THRESHOLD: i32 = 1000;
 
 #[derive(Debug, Default)]
 pub struct Tracker {
     next_sequence: Option<u32>,
     next_frame: Option<u32>,
-    /// Packets missing from the sequence: lost in the network.
-    pub lost_packets: u64,
-    /// Conversions missing from the frame indices: lost anywhere.
+    /// Conversions missing from the frame indices: lost on the device
+    /// (TCP itself does not lose data).
     pub lost_frames: u64,
-    /// Packets that arrived after a newer one and were dropped.
-    pub late_packets: u64,
+    /// Frames received twice: resent after a reconnect, before the device
+    /// learned that they had arrived.
+    pub duplicate_frames: u64,
     pub restarts: u64,
 }
 
 impl Tracker {
-    /// Accounts for a packet. Returns `false` for a late or duplicate packet,
-    /// whose frames should be ignored.
-    pub fn on_packet(&mut self, header: &Header) -> bool {
+    /// Accounts for a packet and returns how many of its leading frames were
+    /// already received and must be skipped.
+    pub fn on_packet(&mut self, header: &Header) -> usize {
+        // The device keeps counting packets across reconnects, so only a
+        // restart makes the sequence go back.
         if let Some(expected) = self.next_sequence {
-            // Wrapping difference reinterpreted as signed: correct across the
-            // u32 overflow as long as the real distance is below 2^31.
-            let gap = header.sequence.wrapping_sub(expected) as i32;
-            if gap < -RESTART_THRESHOLD {
+            // Wrapping difference as signed: correct across u32 overflow.
+            if (header.sequence.wrapping_sub(expected) as i32) < 0 {
                 self.restarts += 1;
                 self.next_frame = None;
-            } else if gap < 0 {
-                self.late_packets += 1;
-                return false;
-            } else {
-                self.lost_packets += gap as u64;
             }
         }
         self.next_sequence = Some(header.sequence.wrapping_add(1));
 
-        if let Some(expected) = self.next_frame {
-            let gap = header.first_frame.wrapping_sub(expected) as i32;
-            if gap > 0 {
-                self.lost_frames += gap as u64;
+        let count = u32::from(header.frame_count);
+        let end = header.first_frame.wrapping_add(count);
+        let Some(next) = self.next_frame else {
+            self.next_frame = Some(end);
+            return 0;
+        };
+
+        let gap = header.first_frame.wrapping_sub(next) as i32;
+        if gap >= 0 {
+            self.lost_frames += gap as u64;
+            self.next_frame = Some(end);
+            0
+        } else {
+            let seen = gap.unsigned_abs().min(count);
+            self.duplicate_frames += u64::from(seen);
+            if seen < count {
+                self.next_frame = Some(end);
             }
+            seen as usize
         }
-        self.next_frame = Some(
-            header
-                .first_frame
-                .wrapping_add(u32::from(header.frame_count)),
-        );
-        true
+    }
+
+    /// The first conversion index not received yet: what to acknowledge.
+    pub fn next_frame(&self) -> Option<u32> {
+        self.next_frame
     }
 }
 
@@ -66,53 +71,54 @@ mod tests {
     }
 
     #[test]
-    fn in_order_stream_has_no_losses() {
+    fn in_order_stream() {
         let mut tracker = Tracker::default();
         for i in 0..10 {
-            assert!(tracker.on_packet(&header(i, i * 20, 20)));
+            assert_eq!(tracker.on_packet(&header(i, i * 40, 40)), 0);
         }
-        assert_eq!((tracker.lost_packets, tracker.lost_frames), (0, 0));
+        assert_eq!(tracker.next_frame(), Some(400));
+        assert_eq!((tracker.lost_frames, tracker.duplicate_frames), (0, 0));
     }
 
     #[test]
-    fn lost_packet_counts_packet_and_frames() {
+    fn device_side_gap_counts_lost_frames() {
         let mut tracker = Tracker::default();
-        tracker.on_packet(&header(0, 0, 20));
-        tracker.on_packet(&header(2, 40, 20));
-        assert_eq!((tracker.lost_packets, tracker.lost_frames), (1, 20));
+        tracker.on_packet(&header(0, 0, 7));
+        tracker.on_packet(&header(1, 12, 40));
+        assert_eq!(tracker.lost_frames, 5);
+        assert_eq!(tracker.next_frame(), Some(52));
     }
 
     #[test]
-    fn device_side_gap_counts_frames_only() {
+    fn resent_frames_are_skipped() {
         let mut tracker = Tracker::default();
-        tracker.on_packet(&header(0, 0, 7)); // flushed early because of the gap
-        tracker.on_packet(&header(1, 12, 20));
-        assert_eq!((tracker.lost_packets, tracker.lost_frames), (0, 5));
-    }
-
-    #[test]
-    fn late_packet_is_dropped() {
-        let mut tracker = Tracker::default();
-        tracker.on_packet(&header(5, 100, 20));
-        assert!(!tracker.on_packet(&header(4, 80, 20)));
-        assert_eq!(tracker.late_packets, 1);
+        tracker.on_packet(&header(0, 0, 40));
+        tracker.on_packet(&header(1, 40, 40));
+        // Reconnect: the device had an ack up to 30 and resends from there,
+        // with new sequence numbers.
+        assert_eq!(tracker.on_packet(&header(2, 30, 40)), 40, "fully seen");
+        assert_eq!(tracker.on_packet(&header(3, 70, 40)), 10, "partly seen");
+        assert_eq!(tracker.on_packet(&header(4, 110, 40)), 0);
+        assert_eq!(tracker.duplicate_frames, 50);
+        assert_eq!(tracker.lost_frames, 0);
+        assert_eq!(tracker.next_frame(), Some(150));
     }
 
     #[test]
     fn wraps_around() {
         let mut tracker = Tracker::default();
         tracker.on_packet(&header(u32::MAX, u32::MAX - 9, 10));
-        assert!(tracker.on_packet(&header(0, 0, 20)));
-        assert_eq!((tracker.lost_packets, tracker.lost_frames), (0, 0));
+        assert_eq!(tracker.on_packet(&header(0, 0, 40)), 0);
+        assert_eq!((tracker.lost_frames, tracker.restarts), (0, 0));
     }
 
     #[test]
     fn device_restart_resyncs() {
         let mut tracker = Tracker::default();
-        tracker.on_packet(&header(50_000, 1_000_000, 20));
-        assert!(tracker.on_packet(&header(0, 0, 20)));
-        assert!(tracker.on_packet(&header(1, 20, 20)));
+        tracker.on_packet(&header(500, 20_000, 40));
+        assert_eq!(tracker.on_packet(&header(0, 3, 40)), 0);
         assert_eq!(tracker.restarts, 1);
-        assert_eq!((tracker.lost_packets, tracker.lost_frames), (0, 0));
+        assert_eq!((tracker.lost_frames, tracker.duplicate_frames), (0, 0));
+        assert_eq!(tracker.next_frame(), Some(43));
     }
 }

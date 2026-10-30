@@ -1,93 +1,181 @@
-//! Streams samples to the PC over UDP, see the `protocol` crate.
+//! Streams records to the PC over TCP, see the `protocol` crate.
+//!
+//! The device connects to the receiver and sends packets from the backlog
+//! ring; the receiver acknowledges what has arrived. Records leave the ring
+//! only once acknowledged, and after a reconnect everything unacknowledged
+//! is sent again, so nothing is lost while the ring has room.
 
+use core::cell::Cell;
+use core::convert::Infallible;
 use core::net::SocketAddrV4;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+use embassy_futures::select::{Either, select};
 use embassy_net::Stack;
-use embassy_net::udp::{PacketMetadata, UdpSocket};
-use embassy_time::Instant;
-use log::{error, info};
-use protocol::{MAX_PACKET_LEN, PacketBuilder};
+use embassy_net::tcp::{TcpReader, TcpSocket, TcpWriter};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
+use embedded_io_async::{Read, Write};
+use log::{info, warn};
+use protocol::{ACK_LEN, Ack, MAX_PACKET_LEN, PacketBuilder};
 
-use crate::acquisition::SAMPLES;
+use crate::acquisition::{BacklogConsumer, NEW_DATA};
 
 const HOST_ADDR: &str = env!(
     "HOST_ADDR",
     "set HOST_ADDR in firmware/.cargo/secrets.toml, see secrets.toml.example"
 );
 
-/// Packets queued in the socket while Wi-Fi is busy: 80 ms of data.
-const TX_PACKETS: usize = 4;
+/// Socket send buffer: a few packets, the real buffer is the backlog ring.
+const TX_BUFFER: usize = 8 * MAX_PACKET_LEN;
+/// Without any progress for this long, the connection is considered dead.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// When caught up, a partial packet waits this long for more frames:
+/// keeps packets full at 2 kSPS while bounding the latency.
+const FLUSH_DELAY: Duration = Duration::from_millis(30);
 
 pub static PACKETS_SENT: AtomicU32 = AtomicU32::new(0);
-/// Longest `send_to` since the last [`take_peaks`], in microseconds: long
-/// means the socket buffer was full, i.e. Wi-Fi is not keeping up.
+/// TCP connections that ended with an error and were re-established.
+pub static CONNECTION_LOSSES: AtomicU32 = AtomicU32::new(0);
+pub static CONNECTED: AtomicBool = AtomicBool::new(false);
+/// Longest packet write since the last [`take_send_peak`], in microseconds:
+/// long means the socket buffer was full, i.e. Wi-Fi is not keeping up.
 static SEND_TIME_PEAK_US: AtomicU32 = AtomicU32::new(0);
-/// Highest [`SAMPLES`] fill level since the last [`take_peaks`].
-static QUEUE_PEAK: AtomicU32 = AtomicU32::new(0);
-/// Packets not handed to the stack, e.g. no IP address yet.
-pub static SEND_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// Returns and resets the longest packet write, in microseconds.
+pub fn take_send_peak() -> u32 {
+    SEND_TIME_PEAK_US.swap(0, Ordering::Relaxed)
+}
+
+#[derive(Debug)]
+enum StreamError {
+    Tcp(embassy_net::tcp::Error),
+    /// The receiver closed the connection.
+    Closed,
+    BadAck,
+}
+
+impl From<embassy_net::tcp::Error> for StreamError {
+    fn from(e: embassy_net::tcp::Error) -> Self {
+        Self::Tcp(e)
+    }
+}
 
 #[embassy_executor::task]
-pub async fn stream_task(stack: Stack<'static>) {
+pub async fn stream_task(stack: Stack<'static>, mut ring: BacklogConsumer) {
     let host: SocketAddrV4 = HOST_ADDR.parse().expect("HOST_ADDR is ip:port");
-
-    // The socket never receives, but the stack needs both buffers.
-    let mut rx_meta = [PacketMetadata::EMPTY; 1];
-    let mut rx_buf = [0; 64];
-    let mut tx_meta = [PacketMetadata::EMPTY; TX_PACKETS];
-    let mut tx_buf = [0; TX_PACKETS * MAX_PACKET_LEN];
-    let mut socket = UdpSocket::new(stack, &mut rx_meta, &mut rx_buf, &mut tx_meta, &mut tx_buf);
-    socket.bind(0).expect("ephemeral port is free");
-
-    stack.wait_config_up().await;
-    // The queue overflowed while Wi-Fi was connecting: drop the stale frames
-    // so that the stream starts with fresh, consecutive data.
-    SAMPLES.clear();
-    info!("Streaming to {host}");
-
-    let mut packet = PacketBuilder::new();
+    let mut rx_buffer = [0; 64];
+    let mut tx_buffer = [0; TX_BUFFER];
     let mut sequence: u32 = 0;
+
     loop {
-        let sample = SAMPLES.receive().await;
-        // +1: the sample just taken was in the queue too.
-        QUEUE_PEAK.fetch_max(SAMPLES.len() as u32 + 1, Ordering::Relaxed);
+        stack.wait_config_up().await;
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(SOCKET_TIMEOUT));
 
-        if !packet.accepts(sample.index) {
-            send(&socket, packet.finish(sequence), host).await;
-            sequence = sequence.wrapping_add(1);
+        if let Err(e) = socket.connect(host).await {
+            warn!("TCP connect to {host} failed: {e:?}");
+            Timer::after(RECONNECT_DELAY).await;
+            continue;
         }
-        packet.push(sample.index, &sample.raw);
+        info!(
+            "TCP connected to {host}, resending {} records",
+            ring.unacked()
+        );
+        // Whatever was sent but not acknowledged may have been lost with the
+        // previous connection.
+        ring.rewind();
+        CONNECTED.store(true, Ordering::Relaxed);
 
+        // The reader only records the latest acknowledgement; the writer
+        // owns the ring and applies it. Both futures run in this task, so a
+        // `Cell` is enough: no locking, no `&mut` shared across `.await`.
+        let acked = Cell::new(None);
+        let (mut reader, mut writer) = socket.split();
+        let error = match select(
+            send_loop(&mut writer, &mut ring, &acked, &mut sequence),
+            receive_acks(&mut reader, &acked),
+        )
+        .await
+        {
+            Either::First(Err(e)) | Either::Second(e) => e,
+            Either::First(Ok(never)) => match never {},
+        };
+
+        CONNECTED.store(false, Ordering::Relaxed);
+        CONNECTION_LOSSES.fetch_add(1, Ordering::Relaxed);
+        warn!("TCP connection lost: {error:?}");
+        socket.abort();
+        Timer::after(RECONNECT_DELAY).await;
+    }
+}
+
+/// Sends packets from the ring until an error ends the connection; it never
+/// returns `Ok`, which `Infallible` states in the type.
+async fn send_loop(
+    writer: &mut TcpWriter<'_>,
+    ring: &mut BacklogConsumer,
+    acked: &Cell<Option<u32>>,
+    sequence: &mut u32,
+) -> Result<Infallible, StreamError> {
+    let mut packet = PacketBuilder::new();
+    loop {
+        if let Some(next_frame) = acked.take() {
+            // Wrapping difference as signed: correct across u32 overflow.
+            ring.ack_while(|record| next_frame.wrapping_sub(record.index) as i32 > 0);
+        }
+
+        let Some(record) = ring.peek() else {
+            if packet.is_empty() {
+                NEW_DATA.wait().await;
+            } else if with_timeout(FLUSH_DELAY, NEW_DATA.wait()).await.is_err() {
+                send_packet(writer, &mut packet, sequence).await?;
+            }
+            continue;
+        };
+
+        // A gap in the indices ends the packet: frames in a packet are
+        // consecutive. The record stays unsent and starts the next packet.
+        if !packet.accepts(record.index) {
+            send_packet(writer, &mut packet, sequence).await?;
+            continue;
+        }
+        packet.push(record.index, &record.raw);
+        ring.mark_sent();
         if packet.is_full() {
-            send(&socket, packet.finish(sequence), host).await;
-            sequence = sequence.wrapping_add(1);
+            send_packet(writer, &mut packet, sequence).await?;
         }
     }
 }
 
-/// Returns and resets the peaks: `(longest send in us, queue fill level)`.
-pub fn take_peaks() -> (u32, u32) {
-    (
-        SEND_TIME_PEAK_US.swap(0, Ordering::Relaxed),
-        QUEUE_PEAK.swap(0, Ordering::Relaxed),
-    )
-}
-
-async fn send(socket: &UdpSocket<'_>, bytes: &[u8], host: SocketAddrV4) {
+async fn send_packet(
+    writer: &mut TcpWriter<'_>,
+    packet: &mut PacketBuilder,
+    sequence: &mut u32,
+) -> Result<(), StreamError> {
     let start = Instant::now();
-    let result = socket.send_to(bytes, host).await;
+    writer.write_all(packet.finish(*sequence)).await?;
     let elapsed = start.elapsed().as_micros().try_into().unwrap_or(u32::MAX);
     SEND_TIME_PEAK_US.fetch_max(elapsed, Ordering::Relaxed);
 
-    match result {
-        Ok(()) => {
-            PACKETS_SENT.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(e) => {
-            if SEND_ERRORS.fetch_add(1, Ordering::Relaxed) == 0 {
-                error!("UDP send failed: {e:?}");
+    *sequence = sequence.wrapping_add(1);
+    PACKETS_SENT.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Reads acknowledgements until an error ends the connection.
+async fn receive_acks(reader: &mut TcpReader<'_>, acked: &Cell<Option<u32>>) -> StreamError {
+    let mut buf = [0; ACK_LEN];
+    loop {
+        match reader.read_exact(&mut buf).await {
+            Ok(()) => match Ack::decode(&buf) {
+                Ok(ack) => acked.set(Some(ack.next_frame)),
+                Err(_) => return StreamError::BadAck,
+            },
+            Err(embedded_io_async::ReadExactError::UnexpectedEof) => {
+                return StreamError::Closed;
             }
+            Err(embedded_io_async::ReadExactError::Other(e)) => return e.into(),
         }
     }
 }
