@@ -1,13 +1,19 @@
 //! Web UI: the page, and a WebSocket that streams live samples to it.
+//!
+//! Only our own page may use it: the server listens on loopback, but any
+//! site open in the browser could otherwise read the signal over a
+//! WebSocket (which CORS does not cover) or start a recording with a
+//! cross-site POST. See [`check_origin`].
 
 use std::io;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 
 use axum::Router;
-use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::extract::{Request, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast::{self, error::RecvError};
@@ -18,11 +24,13 @@ use crate::recorder::Command;
 /// Built into the binary, so the receiver runs from any directory.
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 
-/// Shared by all requests; both halves are cheap to clone.
+/// Shared by all requests; every field is cheap to clone.
 #[derive(Clone)]
 struct AppState {
     updates: broadcast::Sender<Update>,
     commands: mpsc::Sender<Command>,
+    /// Where our own page is served from.
+    allowed_origins: Arc<[String]>,
 }
 
 pub async fn serve(
@@ -30,13 +38,48 @@ pub async fn serve(
     updates: broadcast::Sender<Update>,
     commands: mpsc::Sender<Command>,
 ) -> io::Result<()> {
+    let port = listener.local_addr()?.port();
+    let state = AppState {
+        updates,
+        commands,
+        allowed_origins: [
+            format!("http://127.0.0.1:{port}"),
+            format!("http://localhost:{port}"),
+        ]
+        .into(),
+    };
     let app = Router::new()
         .route("/", get(index))
         .route("/ws", get(websocket))
         .route("/api/record/start", post(start_recording))
         .route("/api/record/stop", post(stop_recording))
-        .with_state(AppState { updates, commands });
+        // On the whole router, so a route added later is covered too.
+        .layer(middleware::from_fn_with_state(state.clone(), check_origin))
+        .with_state(state);
     axum::serve(listener, app).await
+}
+
+/// Rejects requests made by pages of other sites.
+///
+/// Browsers send `Origin` with every WebSocket handshake and every
+/// cross-site POST, and a page cannot forge it. That also covers DNS
+/// rebinding: a hostile domain pointed at 127.0.0.1 still carries its own
+/// name. Requests without `Origin` do not come from a page (curl, scripts),
+/// so no other site can be behind them.
+async fn check_origin(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let origin = request.headers().get(header::ORIGIN);
+    if origin_allowed(origin, &state.allowed_origins) {
+        next.run(request).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
+    }
+}
+
+fn origin_allowed(origin: Option<&HeaderValue>, allowed: &[String]) -> bool {
+    match origin {
+        None => true,
+        Some(origin) => allowed.iter().any(|a| origin.as_bytes() == a.as_bytes()),
+    }
 }
 
 async fn index() -> Html<&'static str> {
@@ -97,4 +140,39 @@ async fn stream_updates(mut socket: WebSocket, mut updates: broadcast::Receiver<
 async fn send(socket: &mut WebSocket, update: &Update) -> Result<(), axum::Error> {
     let json = serde_json::to_string(update).expect("updates always serialize");
     socket.send(Message::Text(json.into())).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn allowed() -> Vec<String> {
+        vec![
+            "http://127.0.0.1:8080".into(),
+            "http://localhost:8080".into(),
+        ]
+    }
+
+    #[test]
+    fn accepts_our_page_and_non_browser_clients() {
+        let ours = HeaderValue::from_static("http://localhost:8080");
+        assert!(origin_allowed(Some(&ours), &allowed()));
+        assert!(origin_allowed(None, &allowed()));
+    }
+
+    #[test]
+    fn rejects_other_sites() {
+        for origin in [
+            "https://example.com",
+            // Same host, another port: another origin.
+            "http://127.0.0.1:3000",
+            // A prefix match would let this one in.
+            "http://localhost:8080.evil.example",
+            // Sent by sandboxed iframes and some redirects.
+            "null",
+        ] {
+            let origin = HeaderValue::from_static(origin);
+            assert!(!origin_allowed(Some(&origin), &allowed()), "{origin:?}");
+        }
+    }
 }
