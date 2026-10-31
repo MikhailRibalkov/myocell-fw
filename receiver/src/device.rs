@@ -221,7 +221,9 @@ pub fn run(
         loop {
             match commands.try_recv() {
                 Ok(command) => {
-                    sinks.recording.handle(command);
+                    if let Some(update) = sinks.recording.handle(command) {
+                        sinks.live.send(update);
+                    }
                     sinks.live.send(sinks.recording.status());
                 }
                 Err(TryRecvError::Empty) => break,

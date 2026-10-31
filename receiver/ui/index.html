@@ -45,6 +45,17 @@
   #record-button:disabled { opacity: 0.5; cursor: default; }
   #record-button.active { background: var(--bad); border-color: var(--bad); color: var(--panel); }
   #record-status { color: var(--muted); font-variant-numeric: tabular-nums; word-break: break-all; }
+  #mark-label {
+    font: inherit; padding: 6px 8px; border-radius: 6px; width: 12em; max-width: 100%;
+    border: 1px solid var(--zero); background: var(--panel); color: var(--text);
+  }
+  #mark-button {
+    font: inherit; font-weight: 600; padding: 6px 14px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--zero); background: var(--panel); color: var(--text);
+  }
+  #mark-button:disabled { opacity: 0.5; cursor: default; }
+  :root { --mark: #a16207; }
+  @media (prefers-color-scheme: dark) { :root { --mark: #facc15; } }
 </style>
 </head>
 <body>
@@ -56,6 +67,8 @@
   <div class="record">
     <span id="record-status"></span>
     <button id="record-button" disabled>● Записать</button>
+    <input id="mark-label" maxlength="100" placeholder="подпись метки">
+    <button id="mark-button" disabled title="клавиша M">⚑ Метка (M)</button>
   </div>
 </header>
 <main id="channels"></main>
@@ -77,6 +90,12 @@ let plots = [];
 let expectedIndex = null;
 let lastDataAt = 0;
 let recording = false;
+// Marks shown on the plots, by conversion index.
+let marks = [];
+
+// Samples since the mark, signed: a mark arrives before the batch with its
+// frame (batches go out every 50 ms), so it is briefly in the future.
+const markAge = mark => (expectedIndex - mark.index) | 0;
 
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 
@@ -104,6 +123,7 @@ function onHello(msg) {
   document.getElementById("channels").replaceChildren();
   plots = msg.channels.map(createPlot);
   expectedIndex = null;
+  marks = [];
 }
 
 function onSamples(msg) {
@@ -139,6 +159,7 @@ function draw(plot) {
   let peak = 0;
   for (const v of buf) if (!Number.isNaN(v)) peak = Math.max(peak, Math.abs(v - mean));
   plot.scale = Math.max(peak * 1.1, plot.scale * SCALE_DECAY, MIN_SCALE_UV);
+  const markColor = css("--mark");
 
   ctx.fillStyle = css("--panel");
   ctx.fillRect(0, 0, width, height);
@@ -149,6 +170,20 @@ function draw(plot) {
   for (const f of [0.25, 0.75]) ctx.fillRect(0, Math.round(height * f), width, dpr);
   ctx.fillStyle = css("--zero");
   ctx.fillRect(0, Math.round(height / 2), width, dpr);
+
+  // Marks: their age in samples places them, since the buffer ends at
+  // `expectedIndex` (gaps are filled with as many NaNs as frames were lost).
+  if (expectedIndex !== null) {
+    ctx.fillStyle = markColor;
+    ctx.font = `${12 * dpr}px system-ui, sans-serif`;
+    for (const mark of marks) {
+      const age = markAge(mark);
+      if (age < 0 || age > n) continue;
+      const x = Math.round((n - age) / n * width);
+      ctx.fillRect(x, 0, dpr, height);
+      ctx.fillText(mark.label, x + 4 * dpr, 14 * dpr);
+    }
+  }
 
   // One vertical bar per pixel column from the min to the max of its
   // samples: with several samples per pixel, no spike can fall between
@@ -216,13 +251,14 @@ function onStats(msg) {
 // tab or a disk error may change the state too.
 function onRecording(msg) {
   recording = msg.file !== null;
+  document.getElementById("mark-button").disabled = !recording;
   const button = document.getElementById("record-button");
   const status = document.getElementById("record-status");
   button.disabled = false;
   button.textContent = recording ? "■ Остановить" : "● Записать";
   button.classList.toggle("active", recording);
   if (recording) {
-    status.textContent = `${msg.file} · ${msg.seconds.toFixed(1)} с`;
+    status.textContent = `${msg.file} · ${msg.seconds.toFixed(1)} с · меток ${msg.marks}`;
     status.className = "";
   } else if (msg.error) {
     status.textContent = `ошибка записи: ${msg.error}`;
@@ -247,8 +283,31 @@ async function toggleRecording() {
   }
 }
 
+async function addMark() {
+  if (!recording) return;
+  const input = document.getElementById("mark-label");
+  try {
+    const response = await fetch("/api/mark", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label: input.value }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    input.value = "";
+  } catch (e) {
+    const status = document.getElementById("record-status");
+    status.textContent = `метка не принята: ${e.message}`;
+    status.className = "bad";
+  }
+}
+
 function frame() {
   plots.forEach(draw);
+  // Forget marks that have scrolled out of every plot.
+  if (expectedIndex !== null && plots.length) {
+    const n = plots[0].buffer.length;
+    marks = marks.filter(m => markAge(m) <= n);
+  }
   const status = document.getElementById("device-status");
   if (!lastDataAt) { status.textContent = "нет данных"; status.className = "warn"; }
   else if (performance.now() - lastDataAt > SILENT_MS) { status.textContent = "молчит"; status.className = "bad"; }
@@ -266,9 +325,11 @@ function connect() {
     else if (msg.type === "samples") onSamples(msg);
     else if (msg.type === "recording") onRecording(msg);
     else if (msg.type === "stats") onStats(msg);
+    else if (msg.type === "mark") marks.push({ index: msg.index, label: msg.label });
   };
   ws.onclose = () => {
     document.getElementById("record-button").disabled = true;
+    document.getElementById("mark-button").disabled = true;
     status.textContent = "нет связи, переподключение…";
     status.className = "bad";
     setTimeout(connect, 1000);
@@ -276,6 +337,15 @@ function connect() {
 }
 
 document.getElementById("record-button").addEventListener("click", toggleRecording);
+document.getElementById("mark-button").addEventListener("click", addMark);
+// The hands are busy during an experiment: M marks, whatever the keyboard
+// layout (`code` is the physical key), except while typing a label, where
+// Enter marks instead.
+document.addEventListener("keydown", event => {
+  const typing = event.target.id === "mark-label";
+  if (typing && event.key === "Enter") { event.preventDefault(); addMark(); }
+  else if (!typing && event.code === "KeyM" && !event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey) addMark();
+});
 connect();
 requestAnimationFrame(frame);
 </script>

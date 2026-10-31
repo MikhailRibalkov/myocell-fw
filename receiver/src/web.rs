@@ -8,13 +8,14 @@
 use std::io;
 use std::sync::{Arc, mpsc};
 
-use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast::{self, error::RecvError};
 
@@ -53,6 +54,7 @@ pub async fn serve(
         .route("/ws", get(websocket))
         .route("/api/record/start", post(start_recording))
         .route("/api/record/stop", post(stop_recording))
+        .route("/api/mark", post(mark))
         // On the whole router, so a route added later is covered too.
         .layer(middleware::from_fn_with_state(state.clone(), check_origin))
         .with_state(state);
@@ -97,6 +99,19 @@ async fn start_recording(State(state): State<AppState>) -> StatusCode {
 
 async fn stop_recording(State(state): State<AppState>) -> StatusCode {
     command(&state, Command::Stop)
+}
+
+#[derive(Deserialize)]
+struct MarkRequest {
+    #[serde(default)]
+    label: String,
+}
+
+/// `Json` also demands `Content-Type: application/json`, which a page of
+/// another site cannot send without a CORS preflight: one more barrier
+/// besides the Origin check.
+async fn mark(State(state): State<AppState>, Json(request): Json<MarkRequest>) -> StatusCode {
+    command(&state, Command::Mark(request.label))
 }
 
 /// Accepted, not done: the device thread carries it out within ~50 ms and

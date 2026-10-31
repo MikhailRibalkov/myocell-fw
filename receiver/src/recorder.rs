@@ -2,7 +2,7 @@
 
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use protocol::setup::DATA_RATE;
@@ -12,17 +12,23 @@ use crate::live::{Update, enabled_channels};
 /// At most this much is lost if the receiver dies while recording.
 const FLUSH_PERIOD: Duration = Duration::from_secs(1);
 
+/// Longer labels are cut: a mark names a moment, it is not a note.
+const MAX_LABEL_CHARS: usize = 100;
+
 /// What the web UI asks the device thread to do.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Command {
     Start,
     Stop,
+    /// Marks the newest recorded frame; an empty label gets a number.
+    Mark(String),
 }
 
 /// Writes frames as CSV rows: `index,time_s,CH3_uV,...`.
 pub struct CsvWriter<W: Write> {
     out: W,
     first_index: Option<u32>,
+    last_index: Option<u32>,
     frames: u64,
 }
 
@@ -36,22 +42,31 @@ impl<W: Write> CsvWriter<W> {
         Ok(Self {
             out,
             first_index: None,
+            last_index: None,
             frames: 0,
         })
+    }
+
+    /// Seconds from the first recorded frame, by the conversion count: the
+    /// same time base for the data and the marks.
+    fn time_s(&self, index: u32) -> f64 {
+        let first = self.first_index.unwrap_or(index);
+        f64::from(index.wrapping_sub(first)) / f64::from(DATA_RATE.hz())
     }
 
     /// `samples` are the enabled channels in microvolts. Three decimals keep
     /// the full resolution: one LSB is 0.024 uV at gain 12.
     pub fn write(&mut self, index: u32, samples: &[f32]) -> io::Result<()> {
-        let first = *self.first_index.get_or_insert(index);
+        self.first_index.get_or_insert(index);
         // From the conversion count, not the clock: packets arrive in
         // bursts, and lost frames show up as a jump in both columns.
-        let time_s = f64::from(index.wrapping_sub(first)) / f64::from(DATA_RATE.hz());
+        let time_s = self.time_s(index);
         write!(self.out, "{index},{time_s:.4}")?;
         for sample in samples {
             write!(self.out, ",{sample:.3}")?;
         }
         writeln!(self.out)?;
+        self.last_index = Some(index);
         self.frames += 1;
         Ok(())
     }
@@ -69,10 +84,60 @@ fn file_name(start: chrono::NaiveDateTime) -> String {
     format!("ch{channels}_{}.csv", start.format("%y%m%d_%H%M%S"))
 }
 
+/// `ch34_261031_024622_marks.csv` next to `ch34_261031_024622.csv`.
+fn marks_path(data: &Path) -> PathBuf {
+    let stem = data.file_stem().unwrap_or_default().to_string_lossy();
+    data.with_file_name(format!("{stem}_marks.csv"))
+}
+
+/// A label fit for one CSV field and one line; `None` if nothing is left.
+fn clean_label(label: &str) -> Option<String> {
+    let label: String = label
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_LABEL_CHARS)
+        .collect();
+    let label = label.trim();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
+/// Quotes a field that would otherwise split the row (RFC 4180).
+fn csv_field(text: &str) -> String {
+    if text.contains([',', '"']) {
+        format!("\"{}\"", text.replace('"', "\"\""))
+    } else {
+        text.to_owned()
+    }
+}
+
 struct Active {
     writer: CsvWriter<BufWriter<File>>,
     path: PathBuf,
     last_flush: Instant,
+    marks: u32,
+    /// Opened with the first mark, so a recording without marks has no
+    /// empty file next to it.
+    marks_file: Option<File>,
+}
+
+impl Active {
+    fn write_mark(&mut self, index: u32, label: &str) -> io::Result<()> {
+        let file = match &mut self.marks_file {
+            Some(file) => file,
+            None => {
+                let mut file = File::options()
+                    .write(true)
+                    .create_new(true)
+                    .open(marks_path(&self.path))?;
+                writeln!(file, "index,time_s,label")?;
+                self.marks_file.insert(file)
+            }
+        };
+        // Unbuffered: marks are rare, and each one is worth more than the
+        // second of data a crash may cost.
+        let time_s = self.writer.time_s(index);
+        writeln!(file, "{index},{time_s:.4},{}", csv_field(label))
+    }
 }
 
 /// The recording state, owned by the device thread: it sees every frame in
@@ -97,11 +162,34 @@ impl Recording {
         self.active.is_some()
     }
 
-    pub fn handle(&mut self, command: Command) {
+    /// Returns what the web UI should learn besides the new status.
+    pub fn handle(&mut self, command: Command) -> Option<Update> {
         match command {
             Command::Start => self.start(),
             Command::Stop => self.stop(),
+            Command::Mark(label) => return self.mark(&label),
         }
+        None
+    }
+
+    /// Marks the newest recorded frame: the moment of the click, late by the
+    /// delivery delay (~50-150 ms; more while the device catches up on a
+    /// backlog).
+    fn mark(&mut self, label: &str) -> Option<Update> {
+        let active = self.active.as_mut()?;
+        let Some(index) = active.writer.last_index else {
+            println!("mark ignored: nothing recorded yet");
+            return None;
+        };
+        active.marks += 1;
+        let label = clean_label(label).unwrap_or_else(|| format!("метка {}", active.marks));
+        if let Err(e) = active.write_mark(index, &label) {
+            let active = self.active.take().expect("checked above");
+            self.fail(&active, &e);
+            return None;
+        }
+        println!("mark {:?} at frame {index}", label);
+        Some(Update::Mark { index, label })
     }
 
     fn start(&mut self) {
@@ -127,6 +215,8 @@ impl Recording {
             writer: CsvWriter::new(BufWriter::new(file))?,
             path,
             last_flush: Instant::now(),
+            marks: 0,
+            marks_file: None,
         })
     }
 
@@ -187,16 +277,18 @@ impl Recording {
     }
 
     pub fn status(&self) -> Update {
-        let (file, frames) = match &self.active {
+        let (file, frames, marks) = match &self.active {
             Some(active) => (
                 Some(active.path.display().to_string()),
                 active.writer.frames,
+                active.marks,
             ),
-            None => (None, 0),
+            None => (None, 0, 0),
         };
         Update::Recording {
             file,
             seconds: frames as f64 / f64::from(DATA_RATE.hz()),
+            marks,
             error: self.error.clone(),
         }
     }
@@ -265,6 +357,56 @@ mod tests {
 
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text, "index,time_s,CH3_uV,CH4_uV\n5,0.0000,1.000,2.000\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cleans_and_quotes_labels() {
+        assert_eq!(clean_label("  сжал\nкулак "), Some("сжал кулак".into()));
+        assert_eq!(clean_label(" \t "), None);
+        assert_eq!(
+            clean_label(&"x".repeat(500)).unwrap().chars().count(),
+            MAX_LABEL_CHARS
+        );
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field(r#"a, "b""#), r#""a, ""b""""#);
+    }
+
+    #[test]
+    fn marks_go_to_a_file_next_to_the_data() {
+        let dir = std::env::temp_dir().join(format!("myocell-marks-{}", std::process::id()));
+        let mut recording = Recording::new(&dir);
+        // Not recording: there is nowhere to put a mark.
+        assert_eq!(recording.handle(Command::Mark("x".into())), None);
+        recording.handle(Command::Start);
+        // Recording, but no frame yet: nothing to attach it to.
+        assert_eq!(recording.handle(Command::Mark("x".into())), None);
+
+        recording.write(1000, &[0.0, 0.0]);
+        recording.write(1001, &[0.0, 0.0]);
+        recording.write(1002, &[0.0, 0.0]);
+        let mark = recording.handle(Command::Mark(String::new()));
+        assert_eq!(
+            mark,
+            Some(Update::Mark {
+                index: 1002,
+                label: "метка 1".into()
+            })
+        );
+        recording.handle(Command::Mark("сжал, сильно".into()));
+        let Update::Recording { file, marks, .. } = recording.status() else {
+            panic!("not a recording status");
+        };
+        assert_eq!(marks, 2);
+        recording.handle(Command::Stop);
+
+        let marks_file = marks_path(Path::new(&file.unwrap()));
+        assert!(marks_file.to_string_lossy().ends_with("_marks.csv"));
+        let text = fs::read_to_string(&marks_file).unwrap();
+        assert_eq!(
+            text,
+            "index,time_s,label\n1002,0.0010,метка 1\n1002,0.0010,\"сжал, сильно\"\n"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

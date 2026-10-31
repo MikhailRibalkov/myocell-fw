@@ -35,6 +35,8 @@ pub enum Update {
         first_index: u32,
         channels: Vec<Vec<f32>>,
     },
+    /// A mark at conversion `index`, for the plots.
+    Mark { index: u32, label: String },
     /// Statistics of the last second; `channels` is empty when no frame
     /// arrived.
     Stats {
@@ -47,6 +49,7 @@ pub enum Update {
         file: Option<String>,
         /// Recorded signal so far, by the conversion count.
         seconds: f64,
+        marks: u32,
         /// Why the last recording ended on its own.
         error: Option<String>,
     },
