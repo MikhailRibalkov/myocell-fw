@@ -1,4 +1,6 @@
 //! TCP stream format between the myocell firmware and the PC receiver.
+//! The PC finds the device (see [`discovery`]) and opens the connection to
+//! its [`discovery::DATA_PORT`].
 //!
 //! Device to PC, a sequence of packets:
 //!
@@ -21,6 +23,7 @@
 
 #![no_std]
 
+pub mod discovery;
 pub mod setup;
 
 pub use ads1298::FRAME_LEN;

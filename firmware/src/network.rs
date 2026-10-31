@@ -44,7 +44,7 @@ pub static DISCONNECTS: AtomicU32 = AtomicU32::new(0);
 /// Reconnects forced because the link was too slow, see [`monitor_link`].
 pub static STALL_RECONNECTS: AtomicU32 = AtomicU32::new(0);
 
-/// DHCP client, the data UDP socket and one spare.
+/// DHCP client, the data TCP socket and the discovery UDP socket.
 const SOCKETS: usize = 3;
 static RESOURCES: StaticCell<StackResources<SOCKETS>> = StaticCell::new();
 

@@ -23,6 +23,7 @@ use myocell_fw::acquisition::{
     UNACKED, acquisition_task, take_latency_peaks,
 };
 use myocell_fw::board::Board;
+use myocell_fw::discovery::discovery_task;
 use myocell_fw::network::{self, DISCONNECTS, RSSI_DBM, STALL_RECONNECTS};
 use myocell_fw::stream::{CONNECTED, CONNECTION_LOSSES, PACKETS_SENT, stream_task, take_send_peak};
 
@@ -97,6 +98,7 @@ async fn main(spawner: Spawner) -> ! {
 
     let stack = network::start(spawner, board.wifi);
     spawner.spawn(stream_task(stack, consumer).expect("task pool is free"));
+    spawner.spawn(discovery_task(stack).expect("task pool is free"));
 
     report_status().await
 }

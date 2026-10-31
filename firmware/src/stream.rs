@@ -1,13 +1,14 @@
 //! Streams records to the PC over TCP, see the `protocol` crate.
 //!
-//! The device connects to the receiver and sends packets from the backlog
-//! ring; the receiver acknowledges what has arrived. Records leave the ring
+//! The receiver finds the device by discovery (see [`crate::discovery`]) and
+//! connects to it; the device sends packets from the backlog ring and the
+//! receiver acknowledges what has arrived. Records leave the ring
 //! only once acknowledged, and after a reconnect everything unacknowledged
 //! is sent again, so nothing is lost while the ring has room.
 
 use core::cell::Cell;
 use core::convert::Infallible;
-use core::net::SocketAddrV4;
+use core::net::IpAddr;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_futures::select::{Either, select};
@@ -16,19 +17,17 @@ use embassy_net::tcp::{TcpReader, TcpSocket, TcpWriter};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::{Read, Write};
 use log::{info, warn};
+use protocol::discovery::DATA_PORT;
 use protocol::{ACK_LEN, Ack, MAX_PACKET_LEN, PacketBuilder};
 
 use crate::acquisition::{BacklogConsumer, NEW_DATA};
-
-const HOST_ADDR: &str = env!(
-    "HOST_ADDR",
-    "set HOST_ADDR in firmware/.cargo/secrets.toml, see secrets.toml.example"
-);
+use crate::discovery::CLIENT;
 
 /// Socket send buffer: a few packets, the real buffer is the backlog ring.
 const TX_BUFFER: usize = 8 * MAX_PACKET_LEN;
 /// Without any progress for this long, the connection is considered dead.
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause after a lost connection before listening again.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// When caught up, a partial packet waits this long for more frames:
 /// keeps packets full at 2 kSPS while bounding the latency.
@@ -63,7 +62,6 @@ impl From<embassy_net::tcp::Error> for StreamError {
 
 #[embassy_executor::task]
 pub async fn stream_task(stack: Stack<'static>, mut ring: BacklogConsumer) {
-    let host: SocketAddrV4 = HOST_ADDR.parse().expect("HOST_ADDR is ip:port");
     let mut rx_buffer = [0; 64];
     let mut tx_buffer = [0; TX_BUFFER];
     let mut sequence: u32 = 0;
@@ -73,15 +71,25 @@ pub async fn stream_task(stack: Stack<'static>, mut ring: BacklogConsumer) {
         let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(SOCKET_TIMEOUT));
 
-        if let Err(e) = socket.connect(host).await {
-            warn!("TCP connect to {host} failed: {e:?}");
+        // One receiver at a time: while it streams, nothing listens, and
+        // discovery reports the device as busy.
+        if let Err(e) = socket.accept(DATA_PORT).await {
+            warn!("TCP accept on port {DATA_PORT} failed: {e:?}");
             Timer::after(RECONNECT_DELAY).await;
             continue;
         }
+        let Some(client) = socket.remote_endpoint() else {
+            // Reset right after the handshake.
+            socket.abort();
+            continue;
+        };
         info!(
-            "TCP connected to {host}, resending {} records",
+            "TCP connection from {client}, resending {} records",
             ring.unacked()
         );
+        if let IpAddr::V4(ip) = client.addr.into() {
+            CLIENT.store(ip.to_bits(), Ordering::Relaxed);
+        }
         // Whatever was sent but not acknowledged may have been lost with the
         // previous connection.
         ring.rewind();
@@ -103,6 +111,7 @@ pub async fn stream_task(stack: Stack<'static>, mut ring: BacklogConsumer) {
         };
 
         CONNECTED.store(false, Ordering::Relaxed);
+        CLIENT.store(0, Ordering::Relaxed);
         CONNECTION_LOSSES.fetch_add(1, Ordering::Relaxed);
         warn!("TCP connection lost: {error:?}");
         socket.abort();
