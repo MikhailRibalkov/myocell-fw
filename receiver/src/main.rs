@@ -10,6 +10,7 @@ mod live;
 mod parser;
 mod recorder;
 mod spectrum;
+mod stats;
 mod tracker;
 mod web;
 

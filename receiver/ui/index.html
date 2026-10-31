@@ -33,6 +33,9 @@
   .channel-head { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: baseline; margin-bottom: 4px; }
   .channel-head .name { font-weight: 600; }
   .channel-head .info { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .stats { display: flex; flex-wrap: wrap; gap: 4px 14px; font-variant-numeric: tabular-nums; }
+  .stats span { white-space: nowrap; }
+  .stats .label { color: var(--muted); }
   canvas { display: block; width: 100%; height: 220px; }
   .record { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-left: auto; }
   #record-button {
@@ -49,6 +52,7 @@
   <h1>myocell</h1>
   <span class="status">сервер: <b id="ws-status">подключение…</b></span>
   <span class="status">плата: <b id="device-status">—</b></span>
+  <span class="status" id="link-stats"></span>
   <div class="record">
     <span id="record-status"></span>
     <button id="record-button" disabled>● Записать</button>
@@ -80,11 +84,14 @@ const css = name => getComputedStyle(document.documentElement).getPropertyValue(
 function createPlot(name) {
   const box = document.createElement("section");
   box.className = "channel";
-  box.innerHTML = `<div class="channel-head"><span class="name"></span><span class="info"></span></div><canvas></canvas>`;
+  box.innerHTML = `<div class="channel-head"><span class="name"></span><span class="stats"></span><span class="info"></span></div><canvas></canvas>`;
   box.querySelector(".name").textContent = name;
   document.getElementById("channels").append(box);
   const buffer = new Float32Array(WINDOW_S * sampleRate).fill(NaN);
-  return { canvas: box.querySelector("canvas"), info: box.querySelector(".info"), buffer, head: 0, scale: MIN_SCALE_UV };
+  return {
+    name, canvas: box.querySelector("canvas"), info: box.querySelector(".info"), stats: box.querySelector(".stats"),
+    buffer, head: 0, scale: MIN_SCALE_UV,
+  };
 }
 
 function push(plot, value) {
@@ -166,8 +173,43 @@ function draw(plot) {
     ctx.fillRect(x, top, 1, Math.max(bottom - top, dpr));
   }
 
-  plot.info.textContent =
-    `шкала ±${plot.scale.toFixed(0)} мкВ · среднее (убрано) ${mean.toFixed(0)} мкВ · окно ${WINDOW_S} с`;
+  // The offset itself is in the stats; the plot shows the signal around it.
+  plot.info.textContent = `график: ±${plot.scale.toFixed(0)} мкВ, смещение убрано, ${WINDOW_S} с`;
+}
+
+// Above this share of the input range the contact should be fixed before
+// the channel saturates: offsets drift by tens of millivolts.
+const NEAR_FULL_SCALE = 0.8;
+const SATURATED = 0.99;
+
+const formatUv = uv => Math.abs(uv) >= 1000 ? `${(uv / 1000).toFixed(1)} мВ` : `${uv.toFixed(1)} мкВ`;
+
+function stat(label, value, cls = "") {
+  return `<span><span class="label">${label}</span> <b class="${cls}">${value}</b></span>`;
+}
+
+// Once a second; computed on the server, which sees every frame.
+function onStats(msg) {
+  const link = msg.link;
+  const lossClass = link.lost_frames > 0 ? "warn" : "";
+  document.getElementById("link-stats").innerHTML =
+    stat("кадров/с", link.frames) + " · " +
+    stat("потери", link.lost_frames, lossClass) + " · " +
+    stat("повторы", link.duplicate_frames) + " · " +
+    stat("перезапуски", link.restarts, link.restarts > 0 ? "warn" : "");
+  for (const ch of msg.channels) {
+    const plot = plots.find(p => p.name === ch.name);
+    if (!plot) continue;
+    const share = ch.peak_uv / ch.full_scale_uv;
+    const [rangeClass, rangeNote] =
+      share >= SATURATED ? ["bad", " НАСЫЩЕНИЕ"] :
+      share >= NEAR_FULL_SCALE ? ["warn", " близко к пределу"] : ["", ""];
+    plot.stats.innerHTML =
+      stat("смещение", formatUv(ch.offset_uv)) +
+      stat("пик", `${formatUv(ch.peak_uv)} (${(share * 100).toFixed(0)}% шкалы)${rangeNote}`, rangeClass) +
+      stat("50 Гц", formatUv(ch.mains_uv[0])) +
+      stat("без сети", formatUv(ch.rest_uv));
+  }
 }
 
 // The button shows what the server reports, not what was clicked: another
@@ -223,6 +265,7 @@ function connect() {
     if (msg.type === "hello") onHello(msg);
     else if (msg.type === "samples") onSamples(msg);
     else if (msg.type === "recording") onRecording(msg);
+    else if (msg.type === "stats") onStats(msg);
   };
   ws.onclose = () => {
     document.getElementById("record-button").disabled = true;

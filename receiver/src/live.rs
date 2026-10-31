@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 use protocol::setup::{CHANNEL_CONFIG, DATA_RATE};
 use serde::Serialize;
 
+use crate::stats::{ChannelStats, LinkStats};
+
 /// How long samples are collected before they go out: short enough for a
 /// smooth plot, long enough to keep the message count low.
 pub const BATCH_PERIOD: Duration = Duration::from_millis(50);
@@ -32,6 +34,12 @@ pub enum Update {
     Samples {
         first_index: u32,
         channels: Vec<Vec<f32>>,
+    },
+    /// Statistics of the last second; `channels` is empty when no frame
+    /// arrived.
+    Stats {
+        link: LinkStats,
+        channels: Vec<ChannelStats>,
     },
     /// Sent on every change and once a second, so a new tab learns it too.
     Recording {
