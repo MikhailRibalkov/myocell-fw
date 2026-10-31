@@ -37,6 +37,18 @@
   .stats span { white-space: nowrap; }
   .stats .label { color: var(--muted); }
   canvas { display: block; width: 100%; height: 220px; }
+  .devices { background: var(--panel); border-radius: 8px; padding: 8px 12px; margin-bottom: 12px; }
+  .devices-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; }
+  .devices-head h2 { font-size: 15px; margin: 0; }
+  #devices-status { color: var(--muted); }
+  .devices table { border-collapse: collapse; width: 100%; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .devices td { padding: 4px 12px 4px 0; border-top: 1px solid var(--grid); white-space: nowrap; }
+  .devices-scroll { overflow-x: auto; }
+  .devices button, #discover-button {
+    font: inherit; padding: 4px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid var(--zero); background: var(--panel); color: var(--text);
+  }
+  .devices button:disabled { opacity: 0.5; cursor: default; }
   .record { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-left: auto; }
   #record-button {
     font: inherit; font-weight: 600; padding: 6px 14px; border-radius: 6px; cursor: pointer;
@@ -71,6 +83,14 @@
     <button id="mark-button" disabled title="клавиша M">⚑ Метка (M)</button>
   </div>
 </header>
+<section class="devices">
+  <div class="devices-head">
+    <h2>Устройства</h2>
+    <button id="discover-button">Найти</button>
+    <span id="devices-status"></span>
+  </div>
+  <div class="devices-scroll"><table><tbody id="devices-list"></tbody></table></div>
+</section>
 <main id="channels"></main>
 
 <script>
@@ -90,6 +110,11 @@ let plots = [];
 let expectedIndex = null;
 let lastDataAt = 0;
 let recording = false;
+// The device the server streams from (`target`), as it reports.
+let connection = { target: null, connected: false, error: null };
+// The last discovery result.
+let devices = [];
+
 // Marks shown on the plots, by conversion index.
 let marks = [];
 
@@ -301,6 +326,87 @@ async function addMark() {
   }
 }
 
+async function post(path, body) {
+  const options = { method: "POST" };
+  if (body !== undefined) {
+    options.headers = { "Content-Type": "application/json" };
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  return response;
+}
+
+async function discover() {
+  const button = document.getElementById("discover-button");
+  const status = document.getElementById("devices-status");
+  button.disabled = true;
+  status.textContent = "поиск…";
+  status.className = "";
+  try {
+    devices = await (await post("/api/discover")).json();
+    status.textContent = devices.length ? `найдено: ${devices.length}` : "устройства не найдены";
+  } catch (e) {
+    status.textContent = `поиск не удался: ${e.message}`;
+    status.className = "bad";
+  }
+  button.disabled = false;
+  renderDevices();
+}
+
+function onConnection(msg) {
+  connection = msg;
+  renderDevices();
+}
+
+// Built with textContent: names and versions come from the network, and
+// must not become markup.
+function renderDevices() {
+  const rows = devices.map(d => ({ ...d }));
+  // A device connected by address (command line) may not be in the list.
+  if (connection.target && !rows.some(d => d.address === connection.target)) {
+    rows.push({ name: "—", address: connection.target, firmware: "", client: null });
+  }
+  const list = document.getElementById("devices-list");
+  list.replaceChildren(...rows.map(device => {
+    const ours = device.address === connection.target;
+    let state, cls = "";
+    if (ours && connection.connected) { state = "подключена"; cls = "ok"; }
+    else if (ours) { state = connection.error ? `переподключение: ${connection.error}` : "подключение…"; cls = "warn"; }
+    else if (device.client) { state = `занята (${device.client})`; cls = "warn"; }
+    else state = "свободна";
+
+    const button = document.createElement("button");
+    button.textContent = ours ? "Отключить" : "Подключить";
+    button.addEventListener("click", () => ours ? disconnectDevice() : connectTo(device.address));
+
+    const row = document.createElement("tr");
+    const cells = [device.name, device.address, device.firmware && `прошивка ${device.firmware}`];
+    for (const text of cells) {
+      const cell = document.createElement("td");
+      cell.textContent = text || "";
+      row.append(cell);
+    }
+    const stateCell = document.createElement("td");
+    stateCell.textContent = state;
+    stateCell.className = cls;
+    const actionCell = document.createElement("td");
+    actionCell.append(button);
+    row.append(stateCell, actionCell);
+    return row;
+  }));
+}
+
+async function connectTo(address) {
+  try { await post("/api/connect", { address }); }
+  catch (e) { document.getElementById("devices-status").textContent = `подключение не принято: ${e.message}`; }
+}
+
+async function disconnectDevice() {
+  try { await post("/api/disconnect"); }
+  catch (e) { document.getElementById("devices-status").textContent = `отключение не принято: ${e.message}`; }
+}
+
 function frame() {
   plots.forEach(draw);
   // Forget marks that have scrolled out of every plot.
@@ -318,13 +424,18 @@ function frame() {
 function connect() {
   const status = document.getElementById("ws-status");
   const ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => { status.textContent = "подключён"; status.className = "ok"; };
+  ws.onopen = () => {
+    status.textContent = "подключён";
+    status.className = "ok";
+    discover();
+  };
   ws.onmessage = event => {
     const msg = JSON.parse(event.data);
     if (msg.type === "hello") onHello(msg);
     else if (msg.type === "samples") onSamples(msg);
     else if (msg.type === "recording") onRecording(msg);
     else if (msg.type === "stats") onStats(msg);
+    else if (msg.type === "connection") onConnection(msg);
     else if (msg.type === "mark") marks.push({ index: msg.index, label: msg.label });
   };
   ws.onclose = () => {
@@ -338,6 +449,7 @@ function connect() {
 
 document.getElementById("record-button").addEventListener("click", toggleRecording);
 document.getElementById("mark-button").addEventListener("click", addMark);
+document.getElementById("discover-button").addEventListener("click", discover);
 // The hands are busy during an experiment: M marks, whatever the keyboard
 // layout (`code` is the physical key), except while typing a label, where
 // Enter marks instead.

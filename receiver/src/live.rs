@@ -35,6 +35,14 @@ pub enum Update {
         first_index: u32,
         channels: Vec<Vec<f32>>,
     },
+    /// The chosen device and the connection to it; sent on every change
+    /// and once a second.
+    Connection {
+        target: Option<String>,
+        connected: bool,
+        /// Why the last connection attempt failed.
+        error: Option<String>,
+    },
     /// A mark at conversion `index`, for the plots.
     Mark { index: u32, label: String },
     /// Statistics of the last second; `channels` is empty when no frame

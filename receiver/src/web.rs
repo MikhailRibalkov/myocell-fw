@@ -6,6 +6,7 @@
 //! cross-site POST. See [`check_origin`].
 
 use std::io;
+use std::net::SocketAddr;
 use std::sync::{Arc, mpsc};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -19,8 +20,10 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast::{self, error::RecvError};
 
+use crate::device::Command;
+use crate::discovery::{self, Device};
 use crate::live::Update;
-use crate::recorder::Command;
+use crate::recorder;
 
 /// Built into the binary, so the receiver runs from any directory.
 const INDEX_HTML: &str = include_str!("../ui/index.html");
@@ -55,6 +58,9 @@ pub async fn serve(
         .route("/api/record/start", post(start_recording))
         .route("/api/record/stop", post(stop_recording))
         .route("/api/mark", post(mark))
+        .route("/api/discover", post(discover))
+        .route("/api/connect", post(connect))
+        .route("/api/disconnect", post(disconnect))
         // On the whole router, so a route added later is covered too.
         .layer(middleware::from_fn_with_state(state.clone(), check_origin))
         .with_state(state);
@@ -94,11 +100,32 @@ async fn websocket(upgrade: WebSocketUpgrade, State(state): State<AppState>) -> 
 }
 
 async fn start_recording(State(state): State<AppState>) -> StatusCode {
-    command(&state, Command::Start)
+    command(&state, Command::Record(recorder::Command::Start))
 }
 
 async fn stop_recording(State(state): State<AppState>) -> StatusCode {
-    command(&state, Command::Stop)
+    command(&state, Command::Record(recorder::Command::Stop))
+}
+
+/// Answers once the devices had their time to reply (under a second).
+async fn discover() -> Result<Json<Vec<Device>>, (StatusCode, String)> {
+    match discovery::discover().await {
+        Ok(devices) => Ok(Json(devices)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct ConnectRequest {
+    address: SocketAddr,
+}
+
+async fn connect(State(state): State<AppState>, Json(request): Json<ConnectRequest>) -> StatusCode {
+    command(&state, Command::Connect(request.address))
+}
+
+async fn disconnect(State(state): State<AppState>) -> StatusCode {
+    command(&state, Command::Disconnect)
 }
 
 #[derive(Deserialize)]
@@ -111,7 +138,10 @@ struct MarkRequest {
 /// another site cannot send without a CORS preflight: one more barrier
 /// besides the Origin check.
 async fn mark(State(state): State<AppState>, Json(request): Json<MarkRequest>) -> StatusCode {
-    command(&state, Command::Mark(request.label))
+    command(
+        &state,
+        Command::Record(recorder::Command::Mark(request.label)),
+    )
 }
 
 /// Accepted, not done: the device thread carries it out within ~50 ms and

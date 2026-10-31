@@ -1,8 +1,9 @@
-//! The device side: one TCP connection from the board at a time, whose
-//! packets are parsed, deduplicated and acknowledged.
+//! The device side: a TCP connection to the board chosen in the web UI,
+//! whose packets are parsed, deduplicated and acknowledged. The connection
+//! is re-established until the user disconnects.
 
 use std::io::{self, ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -14,7 +15,7 @@ use protocol::setup::{CHANNEL_CONFIG, DATA_RATE};
 
 use crate::live::{Batcher, Update, enabled_channels};
 use crate::parser::StreamParser;
-use crate::recorder::{Command, Recording};
+use crate::recorder::{self, Recording};
 use crate::stats::{ChannelStats, LinkStats};
 use crate::tracker::Tracker;
 
@@ -26,6 +27,22 @@ const READ_TIMEOUT: Duration = Duration::from_millis(50);
 /// A connection without data for this long is dead, e.g. the device lost
 /// Wi-Fi and could not even reset the connection.
 const DEAD_TIMEOUT: Duration = Duration::from_secs(15);
+/// The device is on the local network: it answers within milliseconds or
+/// not at all.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Between attempts to reach the chosen device. Also covers the second the
+/// device pauses before listening again after a lost connection.
+const RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// What the web UI asks the device thread to do.
+#[derive(Clone, Debug)]
+pub enum Command {
+    Record(recorder::Command),
+    /// Stream from the device at this address, reconnecting until
+    /// [`Command::Disconnect`].
+    Connect(SocketAddr),
+    Disconnect,
+}
 
 /// What arrived during one report period. Samples are in microvolts.
 struct Window {
@@ -117,8 +134,6 @@ struct Connection {
 
 impl Connection {
     fn new(stream: TcpStream, peer: SocketAddr) -> io::Result<Self> {
-        // Accepted sockets of a non-blocking listener may inherit the flag.
-        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
         // Acks are tiny: send them now instead of waiting to batch them.
         stream.set_nodelay(true)?;
@@ -193,20 +208,96 @@ impl Connection {
     }
 }
 
-/// Serves the device: accepts its connections, acknowledges data, records
-/// on command and reports statistics. Returns only on a listener error.
+/// The device the user chose and how the connection to it is going.
+struct Link {
+    target: Option<SocketAddr>,
+    connection: Option<Connection>,
+    next_attempt: Instant,
+    /// Why the last attempt failed; printed once, not every retry.
+    error: Option<String>,
+    connections: u32,
+}
+
+impl Link {
+    fn status(&self) -> Update {
+        Update::Connection {
+            target: self.target.map(|t| t.to_string()),
+            connected: self.connection.is_some(),
+            error: self.error.clone(),
+        }
+    }
+
+    /// Returns whether the status changed.
+    fn handle(&mut self, command: &Command) -> bool {
+        match *command {
+            Command::Connect(target) => {
+                if self.target != Some(target) {
+                    self.connection = None;
+                }
+                self.target = Some(target);
+                self.error = None;
+                self.next_attempt = Instant::now();
+            }
+            Command::Disconnect => {
+                if let Some(target) = self.target.take() {
+                    println!("disconnected from {target}");
+                }
+                self.connection = None;
+                self.error = None;
+            }
+            Command::Record(_) => return false,
+        }
+        true
+    }
+
+    /// Tries to connect if a device is chosen, not connected and due.
+    /// Returns whether the status changed.
+    fn connect_due(&mut self) -> io::Result<bool> {
+        let Some(target) = self.target else {
+            return Ok(false);
+        };
+        if self.connection.is_some() || Instant::now() < self.next_attempt {
+            return Ok(false);
+        }
+        // Blocks this thread for up to CONNECT_TIMEOUT: nothing streams
+        // meanwhile anyway, and commands wait in their channel.
+        match TcpStream::connect_timeout(&target, CONNECT_TIMEOUT) {
+            Ok(stream) => {
+                println!("connected to {target}");
+                self.connection = Some(Connection::new(stream, target)?);
+                self.connections += 1;
+                self.error = None;
+                Ok(true)
+            }
+            Err(e) => {
+                self.next_attempt = Instant::now() + RETRY_DELAY;
+                let error = e.to_string();
+                let changed = self.error.as_ref() != Some(&error);
+                if changed {
+                    println!("cannot connect to {target}: {error}, retrying");
+                }
+                self.error = Some(error);
+                Ok(changed)
+            }
+        }
+    }
+}
+
+/// Serves the chosen device: connects, acknowledges data, records on
+/// command and reports statistics. Returns when the web server is gone.
 pub fn run(
-    listener: TcpListener,
     live: LiveFeed,
     commands: Receiver<Command>,
     recording: Recording,
+    target: Option<SocketAddr>,
 ) -> io::Result<()> {
-    // Polled for new connections between reads: the newest one wins, since
-    // a device that reconnects has given up on the old one.
-    listener.set_nonblocking(true)?;
-
-    let mut connection: Option<Connection> = None;
-    let mut connections = 0;
+    let mut link = Link {
+        target,
+        connection: None,
+        next_attempt: Instant::now(),
+        error: None,
+        connections: 0,
+    };
     let mut tracker = Tracker::default();
     let mut sinks = Sinks {
         window: Window::new(0),
@@ -220,37 +311,33 @@ pub fn run(
         // (`READ_TIMEOUT`), so polling them here is quick enough.
         loop {
             match commands.try_recv() {
-                Ok(command) => {
+                Ok(Command::Record(command)) => {
                     if let Some(update) = sinks.recording.handle(command) {
                         sinks.live.send(update);
                     }
                     sinks.live.send(sinks.recording.status());
                 }
-                Err(TryRecvError::Empty) => break,
-                // The web server is gone; main ends the process.
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-
-        match listener.accept() {
-            Ok((stream, peer)) => {
-                if let Some(old) = &connection {
-                    println!("{peer} connected, dropping {}", old.peer);
-                } else {
-                    println!("{peer} connected");
+                Ok(command) => {
+                    if link.handle(&command) {
+                        sinks.live.send(link.status());
+                    }
                 }
-                connection = Some(Connection::new(stream, peer)?);
-                connections += 1;
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Ok(()),
             }
-            Err(e) if e.kind() == ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e),
         }
 
-        match &mut connection {
+        if link.connect_due()? {
+            sinks.live.send(link.status());
+        }
+
+        match &mut link.connection {
             Some(c) => {
                 if let Err(e) = c.poll(&mut tracker, &mut sinks) {
-                    println!("connection from {} lost: {e}", c.peer);
-                    connection = None;
+                    println!("connection to {} lost: {e}", c.peer);
+                    link.connection = None;
+                    link.next_attempt = Instant::now() + RETRY_DELAY;
+                    sinks.live.send(link.status());
                 }
             }
             None => std::thread::sleep(READ_TIMEOUT),
@@ -259,8 +346,14 @@ pub fn run(
         sinks.recording.flush_due();
 
         if Instant::now() >= next_report {
-            let update = report(&sinks.window, &tracker, connection.is_some(), connections);
+            let update = report(
+                &sinks.window,
+                &tracker,
+                link.connection.is_some(),
+                link.connections,
+            );
             sinks.live.send(update);
+            sinks.live.send(link.status());
             sinks.window = Window::new(tracker.lost_frames);
             sinks.live.send(sinks.recording.status());
             next_report += REPORT_PERIOD;
